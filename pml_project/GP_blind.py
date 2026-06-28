@@ -37,12 +37,12 @@ import experiment as E
 warnings.filterwarnings("ignore")
 torch.set_default_dtype(torch.double)
 
-# ---- reduced rollout scale (the rollout is the slow part); bump for a real run
-N_PART = 2000
-TARGET = 100
+# ---- reduced rollout scale 
+N_PART = 2000   #3000
+TARGET = 100    #200
 HORIZONS = [5, 20, 40]
 STRATA = [("low", 0.0, 0.35), ("high", 0.75, float(np.log(3)) + 1e-9)]
-# ---- GP fit capacity (proposal: M=256, k-means init, minibatch 1024, up to 2e4 steps). 
+# ---- GP fit capacity. 
 M_IND = 256
 STEPS = 3000
 BATCH = 1024
@@ -77,7 +77,7 @@ def make_training_data_blind(K=200, T=300, n_keep=30000, seed=1):
 
 # ============================ fit two SVGPs ============================
 """
-Fit two SVGD, one per velocity component d in {x,y}.
+Fit two SVGP, one per velocity component d in {x,y}.
 We use ARD-SE kernel, standarized inputs, M inducing points (obtained with random init),
 minibatch ELBO with Adam. We used RBF because BoTorch native.
 """
@@ -93,7 +93,7 @@ def fit_blind(Z, DV, M=M_IND, steps=STEPS, batch=BATCH, lr=0.01, seed=0):
     gps = []
     for d in range(2):
         yd = torch.as_tensor(DV[:, d:d + 1])
-        ind = Zt[torch.randperm(n)[:M]].clone()   # random inducing init (k-means optional)
+        ind = Zt[torch.randperm(n)[:M]].clone()   # random inducing init 
         model = SingleTaskVariationalGP(
             Zt, yd, inducing_points=ind,
             covar_module=gpytorch.kernels.ScaleKernel(
@@ -282,12 +282,13 @@ if __name__ == "__main__":
 
     rng = np.random.default_rng(404)
     cands = E.collect_origins(rng)                        # reuse experiment.py pool
-    strat = stratify_local(cands, STRATA, TARGET, rng)
+    # strat = stratify_local(cands, STRATA, TARGET, rng)
+    strat = E.stratify(cands, rng)
 
     print(f"Mode-blind GP propagator (N_part={N_PART}, reduced scale):")
     print(f"{'stratum':>6} {'n':>4} {'H':>4} {'mean dCRPS (A-C)':>18} "
           f"{'95% CI':>22} {'covA':>6} {'covC':>6}")
-    for name, _, _ in STRATA:
+    for name, _, _ in E.STRATA:
         acc = {h: {"d": [], "covA": [], "covC": [], "sid": []} for h in HORIZONS}
         for k, c in enumerate(strat[name]):
             r = score_blind(c, gps, transform, noise, HORIZONS, N_PART, seed=7 * k + 1)
@@ -308,6 +309,12 @@ if __name__ == "__main__":
             print(f"   -> PRIMARY (high, H=20) cluster 95% CI "
                   f"[{cc[0]:.4f}, {cc[1]:.4f}]  mean {mc:.4f}")
     print("\n(* = 95% CI excludes 0.  Negative => collapse hurts.  Watch coverage:")
+    print(" if covA/covC fall well below 0.90 at H=40, that is the predicted")
+    print(" mode-blind under-dispersion.)")
+    print(f"\n[gp_blind done in {time.time()-t0:.0f}s]")
+
+
+
     print(" if covA/covC fall well below 0.90 at H=40, that is the predicted")
     print(" mode-blind under-dispersion.)")
     print(f"\n[gp_blind done in {time.time()-t0:.0f}s]")
