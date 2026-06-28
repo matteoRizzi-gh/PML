@@ -36,36 +36,20 @@ Same seed (Common Random Number setup)
 """
 
 def init_particles(post, arm, N, rng):
-    """Draw N particles. Fixed randomness order so all arms stay paired:
-        1. j        ~ Cat(mu)       component labels
-        2. z        ~ N(0, I_4)     shared init normals
-        3. m_indep  ~ Cat(mu)       independent propagation mode
-    Every arm draws all three (even if unused) so j, z, m_indep are IDENTICAL
-    across arms. What each USES:
-      'mix'         : state from component j; propagate under independent mode.
-      'collapse'    : state from moment-matched Gaussian; SAME independent mode.
-                      mix - collapse = cost of collapsing the STATE posterior.
-      'mix_coupled' : state from component j; propagate under j (coupled mode).
-                      mix_coupled - mix = cost of losing mode-state coupling."""
+    """Draw N particles for the given arm. Consumes randomness in a fixed
+    order (component labels, then init normals) so arms A and C are paired."""
     mu, xhat, Phat, xbar, Pbar = post
-    j = rng.choice(3, size=N, p=mu)
-    z = rng.standard_normal((N, 4))
-    m_indep = rng.choice(3, size=N, p=mu)
-    if arm == "mix":
-        L = _chol_batch(Phat)
+    j = rng.choice(3, size=N, p=mu)            # shared component labels
+    z = rng.standard_normal((N, 4))            # shared init normals
+    if arm == "A":
+        L = _chol_batch(Phat)                  # (3,4,4)
         x = xhat[j] + np.einsum("nij,nj->ni", L[j], z)
-        m = m_indep
-    elif arm == "collapse":
+    elif arm == "C":
         Lb = _chol_batch(Pbar[None])[0]
         x = xbar + z @ Lb.T
-        m = m_indep
-    elif arm == "mix_coupled":
-        L = _chol_batch(Phat)
-        x = xhat[j] + np.einsum("nij,nj->ni", L[j], z)
-        m = j.copy()
     else:
         raise ValueError(arm)
-    return x, m
+    return x, j.copy()                         # state (N,4), mode (N,)
 
 
 """
@@ -171,18 +155,6 @@ def closed_form_h1(post, arm, T):
     return mbar, Cbar
 
 
-def sharpness_position(samples_pos, level):
-    """Mean width of the central (level) interval, averaged over the 2 position
-    coords. Reported jointly with coverage: a model can hit nominal coverage by
-    widening intervals, so width is the necessary complement. Per-coord so the
-    paired difference A-C is well-defined, same as coverage."""
-    lo = (1 - level) / 2
-    widths = []
-    for d in range(2):
-        q = np.quantile(samples_pos[:, d], [lo, 1 - lo])
-        widths.append(q[1] - q[0])
-    return float(np.mean(widths))
-
 if __name__ == "__main__":
     # ---- VALIDATION: particle rollout vs closed form at H=1 ----
     rng = np.random.default_rng(0)
@@ -192,7 +164,7 @@ if __name__ == "__main__":
     post = slds.run_imm_multi(y, 0.05, [T])[T]
     N = 200_000
     print(f"H=1 validation (N={N} particles), origin T={T}:")
-    for arm in ("mix", "collapse"):
+    for arm in ("A", "C"):
         xs, ms = init_particles(post, arm, N, np.random.default_rng(7))
         pos1 = oracle_rollout(xs, ms, T, [1], np.random.default_rng(7))[1]
         emp_m, emp_C = pos1.mean(0), np.cov(pos1.T)
