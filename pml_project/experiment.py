@@ -27,7 +27,7 @@ ORIGINS = [60, 80, 100, 120, 140, 160]     # all satisfy T + 40 <= SEQ_LEN
 HORIZONS = [5, 20, 40]
 N_PART = 2000
 N_SEQ = 2000                                  # one origin/seq/stratum -> need many
-TARGET_PER_STRATUM = 100
+TARGET_PER_STRATUM = 150
 LEVEL = 0.90
 LOG3 = np.log(3)
 # Two-stratum design: the high-vs-low contrast carries the claim. Each band is
