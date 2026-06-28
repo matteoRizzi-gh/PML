@@ -18,18 +18,6 @@ HORIZONS = [5, 20, 40]
 STRATA = [("low", 0.0, 0.35), ("high", 0.75, np.log(3) + 1e-9)]
 
 
-def collect(rng):
-    cands = []
-    for sid in range(N_SEQ):
-        modes, x = slds.simulate(E.SEQ_LEN, rng)
-        y = slds.observe(x, E.SIGMA_R, rng)
-        posts = slds.run_imm_multi(y, E.SIGMA_R, E.ORIGINS)
-        for T in E.ORIGINS:
-            post = posts[T]
-            cands.append(dict(H=E.entropy(post[0]), post=post, T=T, sid=sid,
-                              truth={h: x[T + h, :2].copy() for h in HORIZONS}))
-    return cands
-
 
 def score_gp(c, gps, noise_est, seed):
     post, T, truth = c["post"], c["T"], c["truth"]
@@ -56,7 +44,7 @@ if __name__ == "__main__":
           f"true {slds.SIGMA[0]:.3f})")
 
     rng = np.random.default_rng(404)
-    cands = collect(rng)
+    cands = E.collect_origins(rng)
     strat = {name: [c for c in cands if lo <= c["H"] < hi][:TARGET]
              for name, lo, hi in STRATA}
     for name in strat:
@@ -85,6 +73,8 @@ if __name__ == "__main__":
                   f"({len(set(sid_h[20]))} unique seqs)")
     print(f"\n(* = 95% CI excludes 0.  Negative => collapse hurts.)")
     print(f"elapsed {time.time()-t0:.0f}s")
+
+
 
 
 
