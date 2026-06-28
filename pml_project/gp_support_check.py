@@ -110,3 +110,22 @@ if __name__ == "__main__":
     print("profilo GP non e' artefatto del kernel. Se e' grande (>~20%), il GP")
     print("estrapola e il costo-vs-orizzonte del GP va interpretato con cautela.")
     print(f"\nelapsed {time.time()-t0:.0f}s")
+
+
+"""
+--- RESULT ---
+
+Tracks, during a real mode-aware GP rollout from each high-stratum origin, the
+fraction of particles whose velocity leaves the training-support range
+(vx in [-4.35, 4.05], vy in [-5.24, 2.94]) at each horizon.
+
+Finding: 0.0% out-of-support at H=5 and H=20, 0.0% at H=40 (max relative excess
+0.01). The particles never leave the region the GP was trained on, even at the
+longest horizon and in arm 'mix' (the most dispersed init). 
+
+Consequence: the GP's horizon profile is NOT an artifact of RBF prior-reversion
+outside the data. The ARD-SE kernel, despite being a poor structural match for
+the near-linear velocity map, is never asked to extrapolate here, so any
+GP-vs-oracle difference reflects the learned dynamics within support, not
+out-of-support kernel behavior. This closes the kernel-extrapolation concern.
+"""
