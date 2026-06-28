@@ -1,92 +1,210 @@
 """
-Multi-step forecast rollouts under mode uncertainty, two arms:
-  A (Mixture):  particle i drawn from its mode-conditional Gaussian
-                N(xhat^{j_i}, Phat^{j_i})  -- mode-state coupling kept.
-  C (Collapse): particle i drawn from the single moment-matched Gaussian
-                N(xbar, Pbar)              -- mode-state coupling destroyed.
-Both keep the mode marginal mu_T and propagate identically. With common
-random numbers (same component labels j_i, same init normals z, same mode
-paths and process noise across arms), the paired difference CRPS_A - CRPS_C
-isolates exactly the cost of collapsing the multimodal posterior.
+GP propagator -- mode-AWARE version
 
-Oracle propagator = true switching dynamics. (GP propagator: gp_rollout.py.)
-Primary endpoint: CRPS on position. Lower CRPS = better; so a NEGATIVE
-A - C means the collapse hurts.
+We fit one SVGP PER MODE and, at rollout, each particle uses its OWN mode's GP.
+Giving the GP the mode makes this propagation similar to the oracle with a small
+learning error: this is used for a robustness check, does not answer any other issue
+
+Position is the deterministic intergal of the velocity (p += v), so ONLY the 
+velocity map is learned. For each mode m and component d in {x,y} we fit an SVGP:
+                phi = (vx, vy, sinn( omega * t), cos (omega *t))
+them the next velocity is determined on simulated transitions WITH KNOWN modes.
+The time feature let the forced mode recover its forcing.
+
+At rollout each particle gets one coherent Matheron function drawn from its current mode's GP,
+plus iid noise. Same CRN structure as for the oracle.
+
+Note: the SVGP likelihood variance was unreliable (it was inflated), but the posterior
+mean was accurate. So the rollout noise comes from the DATA-DRIVEN residual std (estimate_noise).
+We used RBF kernel because BoTorch do not have native LinearKernel
+
 """
 import numpy as np
-import properscoring as ps
+import torch
+import gpytorch
+from botorch.models import SingleTaskVariationalGP
+from botorch.sampling.pathwise import draw_matheron_paths
+from botorch.sampling.pathwise.prior_samplers import draw_kernel_feature_paths
 import slds
 
-A_MATS = np.stack([slds._A(m) for m in range(3)])      # (3,4,4)
-Q_MATS = np.stack([slds._Q(m) for m in range(3)])      # (3,4,4)
+torch.set_default_dtype(torch.double)
+DIMS = 2
+MODES = 3
 
 
-def _chol_batch(P):
-    return np.linalg.cholesky(P + 1e-10 * np.eye(P.shape[-1]))
-
-
-"""
-Sample N particles:
-    - draw component etiquettes j ~ mu and a matrix of normal z
-    - A-arm: x = x_hat^j + chol(P^j)*z 
-        mode-state coupling preserved
-    - C-arm: x = x_bar + chol(P_bar)*z
-        mode-state coupling destroyed
-Same seed (Common Random Number setup)
-"""
-
-def init_particles(post, arm, N, rng):
-    """Draw N particles for the given arm. Consumes randomness in a fixed
-    order (component labels, then init normals) so arms A and C are paired."""
-    mu, xhat, Phat, xbar, Pbar = post
-    j = rng.choice(3, size=N, p=mu)            # shared component labels
-    z = rng.standard_normal((N, 4))            # shared init normals
-    if arm == "A":
-        L = _chol_batch(Phat)                  # (3,4,4)
-        x = xhat[j] + np.einsum("nij,nj->ni", L[j], z)
-    elif arm == "C":
-        Lb = _chol_batch(Pbar[None])[0]
-        x = xbar + z @ Lb.T
-    else:
-        raise ValueError(arm)
-    return x, j.copy()                         # state (N,4), mode (N,)
+def _features(vel, t):
+    """vel (...,2), scalar/array t -> (...,4) features."""
+    s, c = np.sin(slds.OMEGA * t), np.cos(slds.OMEGA * t)
+    n = vel.shape[0]
+    return np.column_stack([vel[:, 0], vel[:, 1],
+                            np.full(n, s), np.full(n, c)])
 
 
 """
-Propagation. At each step:
-    - p_{t+1} = p_t + v_t
-    - update: v = f_m * v + c + w (c forcing argument for 2-mode and w process noise)
-    - sample the next mode
-The process is vectorized on the N particles.
-
-Rk. by using same seed we have same etiquettes j, same normal z, same process noise,
-and same uniform of transition. This is important so the two paths are identical.
-The only difference is the starting state (coupled or collapsed). This is done so that
-A-C isolate exactly the effect of the initial coupling
+Build PER-MODE training sets from the TRUE simulator. The mode is known here
+and is used to GROUP the data by mode, this grouping is exactly what makes
+the propagator mode-aware. For each transition t -> t+1 record
+    - input  phi_t = (vx_t, vy_t, sin(omega t), cos(omega t))
+    - target v_{t+1}                          
+filed under m = modes[t]. 
 """
 
-def oracle_rollout(x, modes, T, horizons, rng):
-    """Propagate particles with the TRUE switching dynamics from absolute time
-    T. Returns {h: positions (N,2)} for each requested horizon h."""
-    hmax = max(horizons)
-    hset = set(horizons)
-    out = {}
-    for step in range(hmax):
-        t = T + step                           # transition t -> t+1, mode = m_t
+def make_training_data(K=300, T=200, per_mode=5000, seed=1):
+    rng = np.random.default_rng(seed)
+    feats = {m: [] for m in range(MODES)}
+    targs = {m: [] for m in range(MODES)}
+    for _ in range(K):
+        modes, x = slds.simulate(T, rng)
+        for t in range(T):
+            m = modes[t]
+            phi = np.array([x[t, 2], x[t, 3],
+                            np.sin(slds.OMEGA * t), np.cos(slds.OMEGA * t)])
+            feats[m].append(phi)
+            targs[m].append(x[t + 1, 2:])          # next velocity (2,)
+    data = {}
+    for m in range(MODES):
+        F = np.array(feats[m]); Y = np.array(targs[m])
+        idx = rng.permutation(len(F))[:per_mode]
+        data[m] = (F[idx], Y[idx])
+    return data
+
+"""
+Fit ONE SVGP for a single (mode, component)
+
+"""
+def fit_gp(F, y, M=64, steps=700):
+    Ft = torch.as_tensor(F); yt = torch.as_tensor(y).unsqueeze(-1)
+    ind = Ft[torch.randperm(Ft.shape[0])[:M]].clone()
+    # RBF (pathwise-compatible in BoTorch). Its posterior MEAN fits the
+    # dynamics; the unreliable likelihood noise is replaced downstream by a
+    # data-driven residual estimate (estimate_noise). NOTE BoTorch pathwise
+    # does not support a LinearKernel, which would otherwise be ideal here.
+    model = SingleTaskVariationalGP(
+        Ft, yt, inducing_points=ind,
+        covar_module=gpytorch.kernels.ScaleKernel(
+            gpytorch.kernels.RBFKernel(ard_num_dims=4)))
+    mll = gpytorch.mlls.VariationalELBO(model.likelihood, model.model,
+                                        num_data=yt.shape[0])
+    opt = torch.optim.Adam(model.parameters(), lr=0.05)
+    model.train()
+    for _ in range(steps):
+        opt.zero_grad()
+        loss = -mll(model(Ft), yt.squeeze(-1))
+        loss.backward(); opt.step()
+    model.eval()
+    return model
+
+
+"""
+Fit ALL 6 GPs: 
+one per (mode in {0,1,2}) x (component in {x,y}). This 6-model structure is the
+mode-aware design: the mode is supplied to the GP by SELECTING the right model.
+"""
+def fit_all(data):
+    gps = {}
+    for m in range(MODES):
+        F, Y = data[m]
+        for d in range(DIMS):
+            gps[(m, d)] = fit_gp(F, Y[:, d])
+    return gps
+
+
+def validate_fit(gps, data):
+    """Check GP posterior mean recovers the known velocity map on a grid."""
+    print("GP fit validation (RMSE of posterior mean vs true next-velocity map):")
+    rng = np.random.default_rng(9)
+    vgrid = rng.uniform(-2, 2, size=(400, 2))
+    tgrid = rng.integers(0, 200, size=400)
+    for m in range(MODES):
+        phi = _features(vgrid, 0)
+        phi[:, 2] = np.sin(slds.OMEGA * tgrid)
+        phi[:, 3] = np.cos(slds.OMEGA * tgrid)
+        Pt = torch.as_tensor(phi)
+        rms = []
+        for d in range(DIMS):
+            with torch.no_grad():
+                pred = gps[(m, d)].posterior(Pt).mean.squeeze(-1).numpy()
+            c = (slds.A_F * (np.sin if d == 0 else np.cos)(slds.OMEGA * tgrid)
+                 if m == 2 else 0.0)
+            true = slds.F_DIAG[m] * vgrid[:, d] + c
+            rms.append(np.sqrt(np.mean((pred - true) ** 2)))
+        print(f"  mode {m+1}: RMSE dim-x {rms[0]:.4f}  dim-y {rms[1]:.4f}  "
+              f"(velocity scale ~{np.abs(vgrid).mean():.2f})")
+    print("Data-driven noise (residual std) vs true process-noise sigma_m:")
+    est = estimate_noise(gps, data)
+    for m in range(MODES):
+        e = np.mean([est[(m, d)] for d in range(DIMS)])
+        print(f"  mode {m+1}: residual-std ~{e:.4f}   true {slds.SIGMA[m]:.4f}")
+
+
+"""
+The rollout's process noise, estimated FROM DATA: 
+per (mode, component), the std of (true next velocity - GP posterior mean) over the training set. 
+Used INSTEAD of the SVGP likelihood variance, which variational training leaves
+inflated. Because the posterior mean is accurate, this residual std recovers the true sigma_m.
+"""
+
+def estimate_noise(gps, data):
+    est = {}
+    for m in range(MODES):
+        F, Y = data[m]
+        Ft = torch.as_tensor(F)
+        for d in range(DIMS):
+            with torch.no_grad():
+                mean = gps[(m, d)].posterior(Ft).mean.squeeze(-1).numpy()
+            est[(m, d)] = float(np.std(Y[:, d] - mean))
+    return est
+
+
+def _rff(model, sample_shape, num_rff=4096):
+    return draw_kernel_feature_paths(model, sample_shape=sample_shape,
+                                     num_features=num_rff)
+
+def draw_paths(gps, N, seed, noise_est):
+    torch.manual_seed(seed)
+    paths = {}
+    for key, model in gps.items():
+        paths[key] = draw_matheron_paths(
+            model, sample_shape=torch.Size([N]),
+            prior_sampler=lambda model, sample_shape: _rff(model, sample_shape, 4096))
+    return paths, noise_est
+
+
+"""
+Same structure as oracle_rollout, with ONE change: the velocity update is the
+LEARNED GP map instead of the true dynamics. Per step:
+  - p += v                      
+  - build phi from (v, absolute time t)
+  - for each component d: evaluate EVERY mode's path at all particles, then
+    KEEP, per particle, the draw from ITS current mode (sel = modes == m),
+    and add fresh iid noise[(m,d)] 
+  - sample the next mode from the TRUE chain PI (the mode is still tracked and
+    evolved. This per-mode dispatch is what keeps it mode-aware)
+
+    
+"""
+
+def gp_rollout(x, modes, T, horizons, gps, paths, noise, rng):
+    N = x.shape[0]
+    hset, out = set(horizons), {}
+    for step in range(max(horizons)):
+        t = T + step
         pos, vel = x[:, :2], x[:, 2:]
-        pos = pos + vel                        # dt = 1
-        f = slds.F_DIAG[modes][:, None]
-        sig = slds.SIGMA[modes][:, None]
-        c = np.zeros((x.shape[0], 2))
-        is3 = modes == 2
-        c[is3] = slds.A_F * np.array([np.sin(slds.OMEGA * t),
-                                      np.cos(slds.OMEGA * t)])
-        w = rng.standard_normal((x.shape[0], 2)) * sig
-        vel = f * vel + c + w
-        x = np.concatenate([pos, vel], axis=1)
-        # mode transition m_t -> m_{t+1}
-        Prow = slds.PI[modes]                  # (N,3)
-        u = rng.random(x.shape[0])
+        pos = pos + vel
+        phi = _features(vel, t)
+        Phi = torch.as_tensor(phi).unsqueeze(-2)        # (N,1,4) ensemble eval
+        vnew = np.empty_like(vel)
+        for d in range(DIMS):
+            cand = np.empty(N)
+            for m in range(MODES):
+                with torch.no_grad():
+                    g = paths[(m, d)](Phi).squeeze(-1).numpy()   # path i @ input i
+                sel = modes == m
+                cand[sel] = g[sel] + noise[(m, d)] * rng.standard_normal(sel.sum())
+            vnew[:, d] = cand
+        x = np.concatenate([pos, vnew], axis=1)
+        Prow = slds.PI[modes]
+        u = rng.random(N)
         modes = (u[:, None] > np.cumsum(Prow, axis=1)).sum(1)
         h = step + 1
         if h in hset:
@@ -94,81 +212,12 @@ def oracle_rollout(x, modes, T, horizons, rng):
     return out
 
 
-
-"""
-CRPS evaluation. For each coordinate (x,y) we compute CRPS of the particle
-ensemble against teh true value, then we average. 
-Coverage: for each coordinate take the central interval at 'level'% of quantiles. 
-We need to check wheter the true value fall inside of this interval.
-
-CRPS measures quality, while Coverage measure calibration.
-"""
-def crps_position(samples_pos, truth_pos):
-    """Mean over the 2 position coords of the ensemble CRPS."""
-    return float(np.mean([ps.crps_ensemble(truth_pos[d], samples_pos[:, d])
-                          for d in range(2)]))
-
-
-def coverage_position(samples_pos, truth_pos, level):
-    """Per-coord central-interval coverage indicator, averaged over coords."""
-    lo = (1 - level) / 2
-    hits = []
-    for d in range(2):
-        q = np.quantile(samples_pos[:, d], [lo, 1 - lo])
-        hits.append(q[0] <= truth_pos[d] <= q[1])
-    return float(np.mean(hits))
-
-
-# ----------------------------------------------------------------------
-# Closed-form H=1 predictive (for validation)
-# ----------------------------------------------------------------------
-
-"""
-External validation. At H=1 the forecast is a closed form Gaussian Mixture 
-with 3 components. For each mode j, we apply the dynamics A_j to the starting
-Gaussian (((x_hat)^j ; P^j) for A and (x_bar, P_bar) for C). 
-
-We obtain mean A_j x_hat^j + c_j and covarianc eA_j P^j A_j^T + Q_j
-
-"""
-def closed_form_h1(post, arm, T):
-    """Exact position predictive of x_{T+1} as a 3-component Gaussian mixture.
-    Arm A uses mode-conditional (xhat^j, Phat^j); arm C uses (xbar, Pbar)."""
-    mu, xhat, Phat, xbar, Pbar = post
-    means, covs = [], []
-    for j in range(3):
-        Aj, Qj = A_MATS[j], Q_MATS[j]
-        cj = np.zeros(4)
-        if j == 2:
-            cj[2:] = slds.forcing_u(T)
-        if arm == "A":
-            mj = Aj @ xhat[j] + cj
-            Cj = Aj @ Phat[j] @ Aj.T + Qj
-        else:
-            mj = Aj @ xbar + cj
-            Cj = Aj @ Pbar @ Aj.T + Qj
-        means.append(mj[:2]); covs.append(Cj[:2, :2])
-    means = np.array(means); covs = np.array(covs)
-    mbar = (mu[:, None] * means).sum(0)
-    Cbar = sum(mu[j] * (covs[j] + np.outer(means[j] - mbar, means[j] - mbar))
-               for j in range(3))
-    return mbar, Cbar
-
-
 if __name__ == "__main__":
-    # ---- VALIDATION: particle rollout vs closed form at H=1 ----
-    rng = np.random.default_rng(0)
-    modes, x = slds.simulate(200, rng)
-    y = slds.observe(x, 0.05, rng)
-    T = 120
-    post = slds.run_imm_multi(y, 0.05, [T])[T]
-    N = 200_000
-    print(f"H=1 validation (N={N} particles), origin T={T}:")
-    for arm in ("A", "C"):
-        xs, ms = init_particles(post, arm, N, np.random.default_rng(7))
-        pos1 = oracle_rollout(xs, ms, T, [1], np.random.default_rng(7))[1]
-        emp_m, emp_C = pos1.mean(0), np.cov(pos1.T)
-        cf_m, cf_C = closed_form_h1(post, arm, T)
-        print(f"  arm {arm}: |mean err| {np.abs(emp_m-cf_m).max():.4f}  "
-              f"|cov err| {np.abs(emp_C-cf_C).max():.4f}  "
-              f"(mean scale {np.abs(cf_m).max():.2f}, cov scale {np.abs(cf_C).max():.3f})")
+    import time
+    t0 = time.time()
+    print("Training per-mode velocity GPs...")
+    data = make_training_data()
+    gps = fit_all(data)
+    print(f"  trained {len(gps)} SVGPs in {time.time()-t0:.0f}s\n")
+    validate_fit(gps, data)
+    print(f"\ntotal {time.time()-t0:.0f}s")
