@@ -50,26 +50,59 @@ Run the IMM to T and count a hit when argmax mu_T equals the true mode m_T.
 Returns the hit rate.
 """
 
+def entropy(mu):
+    mu = np.clip(mu, 1e-12, 1.0)
+    return float(-(mu * np.log(mu)).sum())
+
+
 def terminal_accuracy(sigma_r, seed):
+    """Terminal mode accuracy AND fraction of origins with H(mu_T) >= 0.75
+    (the 'high' stratum threshold), over N_PILOT pilot sequences."""
     rng = np.random.default_rng(seed)
     correct = 0
+    n_high = 0
     for _ in range(N_PILOT):
         T = int(rng.integers(ORIGIN_LO, ORIGIN_HI + 1))
         modes, x = slds.simulate(T, rng)
         y = slds.observe(x, sigma_r, rng)
         mu, *_ = slds.run_imm(y, sigma_r)
         correct += int(mu.argmax() == modes[-1])
-    return correct / N_PILOT
+        n_high += int(entropy(mu) >= 0.75)
+    return correct / N_PILOT, n_high / N_PILOT
 
 if __name__ == "__main__":
     t0 = time.time()
-    print(f"{'sigma_r':>8} {'term_acc':>9}")
+    print(f"{'sigma_r':>8} {'term_acc':>9} {'frac_high':>10}")
     accs = {}
     for s in GRID:
-        a = terminal_accuracy(s, seed=12345)   # dedicated calibration seed
+        a, fh = terminal_accuracy(s, seed=12345)
         accs[s] = a
-        print(f"{s:>8} {a:>9.3f}")
-    best = min(GRID, key=lambda s: abs(accs[s] - 0.85))
-    print(f"\nclosest to 0.85: sigma_r = {best} (acc={accs[best]:.3f}), "
-          f"in [0.80,0.90]: {0.80 <= accs[best] <= 0.90}")
+        print(f"{s:>8} {a:>9.3f} {fh:>10.3f}")
     print(f"elapsed {time.time()-t0:.1f}s")
+
+
+
+"""
+
+term_acc decresce monotòna con sigma_r, frac_high cresce monotòna. 
+Sono anti-correlate per costruzione: più rumore → modi meno identificabili 
+(accuracy giù) → posterior più diffuse → più entropia (frac_high su). 
+Quindi "accuracy ≈ 0.85" e "tanta massa nell'high" sono obiettivi in 
+conflitto diretto. Sotto 0.80 i modi non sono affidabilmente distinguibili 
+e la posterior mode-conditional perde significato.
+Il criterio "accuracy 0.85" non è il criterio giusto per questo studio.
+Un criterio sano seleziona il valore che serve allo studio. 
+
+
+
+Due vincoli, non un target:
+
+- Vincolo di identificabilità: term_acc ≥ 0.80 (i modi devono essere 
+    distinguibili, altrimenti non c'è una posterior multimodale ben 
+    definita da collassare — è rumore, non multimodalità).
+    Questo elimina 0.1, 0.2, 0.4, 0.8.
+- Obiettivo dato il vincolo: massimizzare frac_high (massa sull'estimando).
+    Tra i sopravvissuti {0.01: 0.055, 0.02: 0.100, 0.05: 0.140}, 
+    il massimo è 0.05.
+
+"""
