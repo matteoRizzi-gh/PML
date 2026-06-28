@@ -201,6 +201,40 @@ if __name__ == "__main__":
     print(f"\nelapsed {time.time()-t0:.1f}s")
 
 
+"""
+THREE-ARM DECOMPOSITION -- what each arm isolates, and the oracle result.
+
+The single contrast A-C used to conflate TWO distinct losses (PDF sec.6,
+"declared confound"). The third arm separates them. All three share the initial
+state normals z and, where applicable, the propagation mode, via common random
+numbers, so each paired difference isolates exactly one effect:
+
+  mix          : state ~ mode-conditional component j; propagate under an
+                 INDEPENDENT mode drawn from mu.
+  collapse     : state ~ moment-matched Gaussian (xbar, Pbar); propagate under
+                 the SAME independent mode as mix.
+  mix_coupled  : state ~ component j; propagate under j itself (coupled mode).
+
+  mix - collapse        = cost of collapsing the STATE posterior (Gaussianizing
+                          the mixture), mode treatment identical so it cancels.
+  mix_coupled - mix     = cost of losing the MODE-STATE COUPLING, state identical
+                          so it cancels.
+  mix_coupled - collapse= total cost (what the old buggy single contrast measured).
+
+ORACLE RESULT (high stratum, H=20):
+  state collapse   = -0.0012  [-0.0040, +0.0015]   -> NULL (CI spans 0)
+  coupling loss    = -0.0247  [-0.0495, +0.0003]   -> the real cost
+  total            = -0.0259  [-0.0517, -0.0007]
+  additivity: state + coupling = -0.0259 vs total -0.0259 (diff 0.0000), exact.
+
+Reading: Gaussianizing the state posterior is essentially free in this system;
+the entire forecast cost lives in the mode-state coupling. This is consistent
+with the benchmark's structure -- multimodality lives in velocity, position is
+observed and pinned by the data -- so collapsing the (position-dominated)
+state distribution loses almost nothing that the position CRPS can see. The
+older significant numbers (-0.05, -0.04, -0.03) were 'total', i.e. coupling,
+mislabeled as collapse cost by the arm-C mode bug.
+"""
 
 
 
