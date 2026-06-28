@@ -68,6 +68,28 @@ def init_particles(post, arm, N, rng):
     return x, m
 
 
+'''
+primary = mix_coupled - mix
+
+
+def init_particles(post, arm, N, rng):
+    """Draw N particles for the given arm. Consumes randomness in a fixed
+    order (component labels, then init normals) so arms A and C are paired."""
+    mu, xhat, Phat, xbar, Pbar = post
+    j = rng.choice(3, size=N, p=mu)            # shared component labels
+    z = rng.standard_normal((N, 4))            # shared init normals
+    if arm == "A":
+        L = _chol_batch(Phat)                  # (3,4,4)
+        x = xhat[j] + np.einsum("nij,nj->ni", L[j], z)
+    elif arm == "C":
+        Lb = _chol_batch(Pbar[None])[0]
+        x = xbar + z @ Lb.T
+    else:
+        raise ValueError(arm)
+    return x, j.copy()                         # state (N,4), mode (N,)
+
+'''
+
 """
 Propagation. At each step:
     - p_{t+1} = p_t + v_t
@@ -200,3 +222,37 @@ if __name__ == "__main__":
         print(f"  arm {arm}: |mean err| {np.abs(emp_m-cf_m).max():.4f}  "
               f"|cov err| {np.abs(emp_C-cf_C).max():.4f}  "
               f"(mean scale {np.abs(cf_m).max():.2f}, cov scale {np.abs(cf_C).max():.3f})")
+
+
+
+"""
+TODO -- open items, in priority order.
+
+DECISION FIRST (blocks everything): pick the headline.
+  (1) "collapsing the STATE posterior is benign" -- primary = mix - collapse ~ 0,
+      explained by observed position + velocity-only separation; OR
+  (2) "the cost is in the mode-state COUPLING" -- primary = mix_coupled - mix
+      (~ -0.025, significant), with the decomposition showing state ~ 0.
+  Both are defensible but they are DIFFERENT theses; one must be the headline.
+
+NOT YET RUN:
+  - aware + blind at three arms. Code is ready, output is not. Needed to check
+    whether the oracle decomposition (state ~ 0, coupling != 0) survives under
+    learned dynamics. Blind: mix_coupled must coincide with mix (no mode) --
+    degeneracy check.
+
+NOT YET DONE (completeness vs the plan):
+  - velocity-space scoring: re-score CRPS on velocity instead of position.
+    Expected NEGATIVE and significant where position is null -- would show the
+    collapse cost the theory predicts lives in velocity, closing the
+    theory-vs-result loop. Highest-value missing piece for either headline.
+  - H=2 exact validation (3^2 = 9 closed-form components): the only check that
+    tests pathwise COHERENCE along the trajectory; current H=1 validation does
+    not (marginal == coherent at H=1). 
+  - PIT / rank histograms: third evaluation metric, never produced.
+
+OBSOLETE (built on the buggy result, discard or redo):
+  - the grow-then-decay vs plateau horizon discussion, and the sharpness
+    "reachable-space" story -- both described the coupling effect, not the
+    state collapse, since state collapse is null.
+"""
