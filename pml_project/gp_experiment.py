@@ -1,7 +1,8 @@
 """
-Collapse-cost experiment under the GP propagator (learned dynamics).
-Question: does the entropy-graded collapse cost survive when the
-dynamics are learned (with error) instead of oracle?
+Collapse-cost experiment under the GP propagator (mode-AWARE, learned dynamics).
+Question: does the entropy-graded collapse cost survive when the dynamics are
+learned (with error) instead of oracle? Same pool as experiment.py (random
+one-origin-per-sequence) so oracle / aware / blind are directly comparable.
 """
 import time
 import numpy as np
@@ -9,14 +10,11 @@ import slds
 import torch
 import rollout as R
 import gp_rollout as G
-import experiment as E   
+import experiment as E
 
-N_SEQ = 2000
-TARGET = 100
 N_PART = 2000
 HORIZONS = [5, 20, 40]
-STRATA = [("low", 0.0, 0.35), ("high", 0.75, np.log(3) + 1e-9)]
-
+# strata, origin pool and stratify all come from experiment.py (single source)
 
 
 def score_gp(c, gps, noise_est, seed):
@@ -45,14 +43,14 @@ if __name__ == "__main__":
 
     rng = np.random.default_rng(404)
     cands = E.collect_origins(rng)
-    strat = {name: [c for c in cands if lo <= c["H"] < hi][:TARGET]
-             for name, lo, hi in STRATA}
-    for name in strat:
-        rng.shuffle(strat[name])
+    strat = E.stratify(cands, rng)
 
-    print(f"\nGP propagator (N_part={N_PART}, reduced scale):")
+    print(f"\nGP propagator mode-AWARE (N_part={N_PART}):")
+    for name, _, _ in E.STRATA:
+        print(f"  {name:>4}: {len(strat[name])} origins "
+              f"({len({c['sid'] for c in strat[name]})} unique seqs)")
     print(f"{'stratum':>6} {'n':>4} {'H':>4} {'mean dCRPS (A-C)':>18} {'95% CI':>22}")
-    for name, _, _ in STRATA:
+    for name, _, _ in E.STRATA:
         per_h = {h: [] for h in HORIZONS}
         sid_h = {h: [] for h in HORIZONS}
         for k, c in enumerate(strat[name]):
@@ -75,7 +73,7 @@ if __name__ == "__main__":
     print(f"elapsed {time.time()-t0:.0f}s")
 
 
-
+    
 
 
 
