@@ -221,3 +221,4 @@ if __name__ == "__main__":
     print(f"  trained {len(gps)} SVGPs in {time.time()-t0:.0f}s\n")
     validate_fit(gps, data)
     print(f"\ntotal {time.time()-t0:.0f}s")
+
