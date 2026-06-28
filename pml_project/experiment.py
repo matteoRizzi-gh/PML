@@ -32,6 +32,8 @@ LEVEL = 0.90
 LOG3 = np.log(3)
 STRATA = [("low", 0.0, 0.35), ("high", 0.75, LOG3 + 1e-9)]
 
+ARMS = ("mix", "collapse", "mix_coupled")
+
 
 def entropy(mu):
     mu = np.clip(mu, 1e-12, 1.0)
@@ -64,25 +66,23 @@ def stratify(cands, rng):
 
 
 def score_origin(c, seed):
-    """Both arms, common random numbers, all horizons. Returns per-horizon dict
-    with CRPS, coverage and sharpness for A and C."""
+    """Three arms, common random numbers, all horizons. Returns per-horizon
+    dict with CRPS / coverage / sharpness for each arm."""
     post, T, truth = c["post"], c["T"], c["truth"]
-    res = {}
     si, sr = seed, seed + 1
     rolls = {}
-    for arm in ("A", "C"):
+    for arm in ARMS:
         xs, ms = R.init_particles(post, arm, N_PART, np.random.default_rng(si))
         rolls[arm] = R.oracle_rollout(xs, ms, T, HORIZONS,
                                       np.random.default_rng(sr))
+    res = {}
     for h in HORIZONS:
         yh = truth[h]
-        res[h] = dict(
-            crpsA=R.crps_position(rolls["A"][h], yh),
-            crpsC=R.crps_position(rolls["C"][h], yh),
-            covA=R.coverage_position(rolls["A"][h], yh, LEVEL),
-            covC=R.coverage_position(rolls["C"][h], yh, LEVEL),
-            shpA=R.sharpness_position(rolls["A"][h], LEVEL),
-            shpC=R.sharpness_position(rolls["C"][h], LEVEL))
+        res[h] = {arm: dict(
+            crps=R.crps_position(rolls[arm][h], yh),
+            cov=R.coverage_position(rolls[arm][h], yh, LEVEL),
+            shp=R.sharpness_position(rolls[arm][h], LEVEL))
+            for arm in ARMS}
     return res
 
 
@@ -121,75 +121,84 @@ if __name__ == "__main__":
     print(f"sigma_r={SIGMA_R}  N_seq={N_SEQ}  N_part={N_PART}")
     print(f"pool {len(cands)}  entropy mean {Hs.mean():.3f} p90 {np.quantile(Hs,0.9):.3f}")
     for name, lo, hi in STRATA:
-        used = len(strat[name])
-        uniq = len({c["sid"] for c in strat[name]})
-        print(f"  {name:>4}: {used} origins ({uniq} unique seqs)")
+        print(f"  {name:>4}: {len(strat[name])} origins "
+              f"({len({c['sid'] for c in strat[name]})} unique seqs)")
 
-    results = {name: {h: {"d": [], "crpsA": [], "crpsC": [],
-                          "covA": [], "covC": [], "shpA": [], "shpC": [],
-                          "sid": []}
+    # per stratum/horizon: store per-arm crps/cov/shp lists, keyed by arm
+    results = {name: {h: {arm: {"crps": [], "cov": [], "shp": []} for arm in ARMS}
                       for h in HORIZONS} for name, _, _ in STRATA}
+    sids = {name: [] for name, _, _ in STRATA}
 
     ORDER = {name: i for i, (name, _, _) in enumerate(STRATA)}
     for name in results:
         for k, c in enumerate(strat[name]):
             r = score_origin(c, seed=10_000 * ORDER[name] + 13 * k)
+            sids[name].append(c["sid"])
             for h in HORIZONS:
-                results[name][h]["d"].append(r[h]["crpsA"] - r[h]["crpsC"])
-                results[name][h]["covA"].append(r[h]["covA"])
-                results[name][h]["covC"].append(r[h]["covC"])
-                results[name][h]["shpA"].append(r[h]["shpA"])
-                results[name][h]["shpC"].append(r[h]["shpC"])
-                results[name][h]["sid"].append(c["sid"])
-                results[name][h]["crpsA"].append(r[h]["crpsA"])
-                results[name][h]["crpsC"].append(r[h]["crpsC"])
+                for arm in ARMS:
+                    results[name][h][arm]["crps"].append(r[h][arm]["crps"])
+                    results[name][h][arm]["cov"].append(r[h][arm]["cov"])
+                    results[name][h][arm]["shp"].append(r[h][arm]["shp"])
 
+    # ---- main table: the headline contrast mix - collapse ----
     print(f"\n{'stratum':>6} {'n':>4} {'H':>4} "
-          f"{'CRPS_A':>8} {'CRPS_C':>8} {'dCRPS':>10} {'cost%':>7} "
-          f"{'95% CI':>22} {'covA':>6} {'covC':>6} {'shpA':>7} {'shpC':>7}")
+          f"{'CRPS_mix':>9} {'CRPS_col':>9} {'dCRPS':>10} {'95% CI':>22} "
+          f"{'cov_m':>6} {'cov_c':>6} {'shp_m':>7} {'shp_c':>7}")
     for name, lo, hi in STRATA:
         for h in HORIZONS:
-            d = results[name][h]["d"]
-            if not d:
-                continue
+            cm = results[name][h]["mix"]["crps"]
+            cc = results[name][h]["collapse"]["crps"]
+            d = [a - b for a, b in zip(cm, cc)]
             m, ci = paired_bootstrap(d)
-            cA = np.mean(results[name][h]["crpsA"])
-            cC = np.mean(results[name][h]["crpsC"])
-            cost = 100.0 * (cC - cA) / cA if cA else float("nan")
-            covA = np.mean(results[name][h]["covA"])
-            covC = np.mean(results[name][h]["covC"])
-            shpA = np.mean(results[name][h]["shpA"])
-            shpC = np.mean(results[name][h]["shpC"])
             sig = "*" if (ci[1] < 0 or ci[0] > 0) else " "
             print(f"{name:>6} {len(d):>4} {h:>4} "
-                  f"{cA:>8.4f} {cC:>8.4f} {m:>9.4f}{sig} {cost:>6.1f}% "
-                  f"[{ci[0]:>8.4f},{ci[1]:>8.4f}] {covA:>6.2f} {covC:>6.2f} "
-                  f"{shpA:>7.2f} {shpC:>7.2f}")
+                  f"{np.mean(cm):>9.4f} {np.mean(cc):>9.4f} {m:>9.4f}{sig} "
+                  f"[{ci[0]:>8.4f},{ci[1]:>8.4f}] "
+                  f"{np.mean(results[name][h]['mix']['cov']):>6.2f} "
+                  f"{np.mean(results[name][h]['collapse']['cov']):>6.2f} "
+                  f"{np.mean(results[name][h]['mix']['shp']):>7.2f} "
+                  f"{np.mean(results[name][h]['collapse']['shp']):>7.2f}")
     print(f"\n(* = 95% CI excludes 0.  Negative dCRPS => collapse hurts.)")
 
-    pe = results["high"][20]
-    if pe["d"]:
-        mn, ci_n = paired_bootstrap(pe["d"])
-        mc, ci_c = cluster_bootstrap(pe["d"], pe["sid"])
-        n_uniq = len(set(pe["sid"]))
-        print(f"\nPRIMARY ENDPOINT (high stratum, H=20):")
-        print(f"  mean dCRPS = {mn:.4f}   (n={len(pe['d'])}, {n_uniq} unique seqs)")
-        print(f"  paired  95% CI [{ci_n[0]:.4f}, {ci_n[1]:.4f}]")
-        print(f"  cluster 95% CI [{ci_c[0]:.4f}, {ci_c[1]:.4f}]")
+    # ---- primary endpoint ----
+    hi_arm = results["high"][20]
+    cm, cc, cf = (hi_arm["mix"]["crps"], hi_arm["collapse"]["crps"],
+                  hi_arm["mix_coupled"]["crps"])
+    d_state = [a - b for a, b in zip(cm, cc)]          # mix - collapse
+    mn, ci_n = paired_bootstrap(d_state)
+    mc, ci_c = cluster_bootstrap(d_state, sids["high"])
+    print(f"\nPRIMARY ENDPOINT (high, H=20): cost of collapsing the STATE posterior")
+    print(f"  mean dCRPS (mix - collapse) = {mn:.4f}   (n={len(d_state)})")
+    print(f"  paired  95% CI [{ci_n[0]:.4f}, {ci_n[1]:.4f}]")
+    print(f"  cluster 95% CI [{ci_c[0]:.4f}, {ci_c[1]:.4f}]")
 
-        # Secondary (ii): paired calibration deviation and sharpness, A-C.
-        dev = [abs(a - LEVEL) - abs(c - LEVEL)
-               for a, c in zip(pe["covA"], pe["covC"])]
-        dshp = [a - c for a, c in zip(pe["shpA"], pe["shpC"])]
-        mdev, ci_dev = paired_bootstrap(dev)
-        msh, ci_sh = paired_bootstrap(dshp)
-        print(f"\nSECONDARY ENDPOINT (high, H=20):")
-        print(f"  calib. deviation A-C = {mdev:+.4f}  "
-              f"95% CI [{ci_dev[0]:+.4f}, {ci_dev[1]:+.4f}]  "
-              f"(~0 => collapse does not hurt calibration)")
-        print(f"  sharpness A-C        = {msh:+.4f}  "
-              f"95% CI [{ci_sh[0]:+.4f}, {ci_sh[1]:+.4f}]  "
-              f"(~0 => collapse does not change interval width)")
+    # ---- decomposition via the third arm ----
+    d_couple = [a - b for a, b in zip(cf, cm)]         # mix_coupled - mix
+    d_total  = [a - b for a, b in zip(cf, cc)]         # mix_coupled - collapse
+    mco, ci_co = paired_bootstrap(d_couple)
+    mto, ci_to = paired_bootstrap(d_total)
+    print(f"\nDECOMPOSITION (high, H=20):")
+    print(f"  state collapse   (mix - collapse)        = {mn:+.4f} "
+          f"[{ci_n[0]:+.4f},{ci_n[1]:+.4f}]")
+    print(f"  coupling loss    (mix_coupled - mix)     = {mco:+.4f} "
+          f"[{ci_co[0]:+.4f},{ci_co[1]:+.4f}]")
+    print(f"  total collapse   (mix_coupled - collapse)= {mto:+.4f} "
+          f"[{ci_to[0]:+.4f},{ci_to[1]:+.4f}]")
+    add = mn + mco
+    print(f"  additivity check: state + coupling = {add:+.4f}  vs  total = {mto:+.4f}"
+          f"  (diff {abs(add-mto):.4f})")
+
+    # ---- secondary: sharpness & calibration of the state collapse ----
+    sm = hi_arm["mix"]["shp"]; sc = hi_arm["collapse"]["shp"]
+    dshp = [a - b for a, b in zip(sm, sc)]
+    msh, ci_sh = paired_bootstrap(dshp)
+    vm = hi_arm["mix"]["cov"]; vc = hi_arm["collapse"]["cov"]
+    dev = [abs(a - LEVEL) - abs(b - LEVEL) for a, b in zip(vm, vc)]
+    mdev, ci_dev = paired_bootstrap(dev)
+    print(f"\nSECONDARY (high, H=20), state collapse mix - collapse:")
+    print(f"  sharpness     = {msh:+.4f} [{ci_sh[0]:+.4f},{ci_sh[1]:+.4f}]")
+    print(f"  calib. dev.   = {mdev:+.4f} [{ci_dev[0]:+.4f},{ci_dev[1]:+.4f}]")
     print(f"\nelapsed {time.time()-t0:.1f}s")
+
 
 
