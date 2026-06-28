@@ -38,10 +38,9 @@ warnings.filterwarnings("ignore")
 torch.set_default_dtype(torch.double)
 
 # ---- reduced rollout scale 
-N_PART = 2000   #3000
-TARGET = 100    #200
+N_PART = 2000     
 HORIZONS = [5, 20, 40]
-STRATA = [("low", 0.0, 0.35), ("high", 0.75, float(np.log(3)) + 1e-9)]
+
 # ---- GP fit capacity. 
 M_IND = 256
 STEPS = 3000
@@ -93,7 +92,7 @@ def fit_blind(Z, DV, M=M_IND, steps=STEPS, batch=BATCH, lr=0.01, seed=0):
     gps = []
     for d in range(2):
         yd = torch.as_tensor(DV[:, d:d + 1])
-        ind = Zt[torch.randperm(n)[:M]].clone()   # random inducing init 
+        ind = Zt[torch.randperm(n)[:M]].clone()
         model = SingleTaskVariationalGP(
             Zt, yd, inducing_points=ind,
             covar_module=gpytorch.kernels.ScaleKernel(
@@ -111,6 +110,7 @@ def fit_blind(Z, DV, M=M_IND, steps=STEPS, batch=BATCH, lr=0.01, seed=0):
         model.eval()
         gps.append(model)
     return gps, (mu_z, sd_z)
+
 
 """
 Just a sanity check
@@ -137,7 +137,7 @@ def fit_sanity(gps, transform, seed=7):
         ll = float(-0.5 * np.mean(resid ** 2 / s2 + np.log(2 * np.pi * s2)))
         print(f"  {('x','y')[d]:>5} {rmse:>8.4f} {resid.std():>10.4f} "
               f"{noise:>14.4f} {ll:>11.3f}")
-    print("  (resid-std >> process sigma is EXPECTED: it is the mode-marginalized")
+    print("  (resid-std >> process sigma is EXPECTED: the mode-marginalized")
     print("   spread the mode-blind GP cannot resolve. That is the design's point.)")
 
 
@@ -161,7 +161,6 @@ def estimate_noise_blind(gps, transform, Z, DV):
         noise.append(float(np.std(DV[:, d] - mean)))
     return noise
 
-
 # ====================== pathwise mode-blind rollout ======================
 
 """
@@ -176,6 +175,7 @@ is part of the CRN.
 def _rff(model, sample_shape, num_rff=4096):
     return draw_kernel_feature_paths(model, sample_shape=sample_shape,
                                      num_features=num_rff)
+
 
 def draw_paths_blind(gps, N, seed):
     torch.manual_seed(seed)
@@ -205,22 +205,21 @@ def blind_rollout(x, T, horizons, gps, transform, paths, noise, rng):
     for step in range(max(horizons)):
         t = T + step
         pos, vel = x[:, :2], x[:, 2:]
-        pos = pos + vel                                   # p_{t+1} = p_t + v_t
+        pos = pos + vel
         s, c = np.sin(slds.OMEGA * t), np.cos(slds.OMEGA * t)
         z = np.column_stack([vel[:, 0], vel[:, 1], np.full(N, s), np.full(N, c)])
-        Zt = torch.as_tensor((z - mu_z) / sd_z).unsqueeze(-2)   # (N,1,4) ensemble
+        Zt = torch.as_tensor((z - mu_z) / sd_z).unsqueeze(-2)
         dv = np.empty((N, 2))
         for d in range(2):
             with torch.no_grad():
-                g = paths[d](Zt).squeeze(-1).numpy()      # path i @ input i
+                g = paths[d](Zt).squeeze(-1).numpy()
             dv[:, d] = g + noise[d] * rng.standard_normal(N)
-        vel = vel + dv                                    # v_{t+1} = v_t + dv
+        vel = vel + dv
         x = np.concatenate([pos, vel], axis=1)
         h = step + 1
         if h in hset:
             out[h] = x[:, :2].copy()
     return out
-
 
 """
 Arms A and C under CRN sheres function deaws, noise strem and the initial normals.
@@ -239,7 +238,7 @@ def score_blind(c, gps, transform, noise, horizons, n_part, seed):
     si, sr = seed, seed + 1
     rolls = {}
     for arm in ("A", "C"):
-        xs, _ = R.init_particles(post, arm, n_part, np.random.default_rng(si))  # mode unused
+        xs, _ = R.init_particles(post, arm, n_part, np.random.default_rng(si))
         rolls[arm] = blind_rollout(xs, T, horizons, gps, transform, paths, noise,
                                    np.random.default_rng(sr))
     res = {}
@@ -252,25 +251,18 @@ def score_blind(c, gps, transform, noise, horizons, n_part, seed):
     return res
 
 
-def stratify_local(cands, strata, target, rng):
-    out = {}
-    for name, lo, hi in strata:
-        pool = [c for c in cands if lo <= c["H"] < hi]
-        rng.shuffle(pool)
-        out[name] = pool[:target]
-    return out
 
 
 # ================================ main ================================
+
 if __name__ == "__main__":
     import time
     t0 = time.time()
     print("=" * 70)
     print("GP-PROPAGATOR EXPERIMENT  --  mode-BLIND (the proposal's GP)")
     print("=" * 70)
-    print("One SVGP per velocity component; mode is NOT an input. Compare with")
-    print("gp_experiment.py (mode-AWARE). Here a null at long horizon is")
-    print("INFORMATIVE (predicted GP under-dispersion may swamp the effect).\n")
+    print("One SVGP per velocity component; mode is NOT an input. A null at long")
+    print("horizon is INFORMATIVE (predicted GP under-dispersion may swamp it).\n")
 
     print(f"Training 2 mode-blind SVGPs (M={M_IND}, steps={STEPS}, batch={BATCH})...")
     Ztr, DVtr = make_training_data_blind()
@@ -281,11 +273,13 @@ if __name__ == "__main__":
     print(f"\nrollout process-noise eta (data-driven): x={noise[0]:.4f}, y={noise[1]:.4f}\n")
 
     rng = np.random.default_rng(404)
-    cands = E.collect_origins(rng)                        # reuse experiment.py pool
-    # strat = stratify_local(cands, STRATA, TARGET, rng)
+    cands = E.collect_origins(rng)
     strat = E.stratify(cands, rng)
 
-    print(f"Mode-blind GP propagator (N_part={N_PART}, reduced scale):")
+    print(f"Mode-blind GP propagator (N_part={N_PART}):")
+    for name, _, _ in E.STRATA:
+        print(f"  {name:>4}: {len(strat[name])} origins "
+              f"({len({c['sid'] for c in strat[name]})} unique seqs)")
     print(f"{'stratum':>6} {'n':>4} {'H':>4} {'mean dCRPS (A-C)':>18} "
           f"{'95% CI':>22} {'covA':>6} {'covC':>6}")
     for name, _, _ in E.STRATA:
@@ -303,18 +297,12 @@ if __name__ == "__main__":
             print(f"{name:>6} {len(acc[h]['d']):>4} {h:>4} {m:>17.4f}{sig} "
                   f"[{ci[0]:>8.4f},{ci[1]:>8.4f}] "
                   f"{np.mean(acc[h]['covA']):>6.2f} {np.mean(acc[h]['covC']):>6.2f}")
-        # cluster CI on the primary endpoint, when this stratum is 'high'
         if name == "high" and 20 in acc:
             mc, cc = E.cluster_bootstrap(acc[20]["d"], acc[20]["sid"])
             print(f"   -> PRIMARY (high, H=20) cluster 95% CI "
                   f"[{cc[0]:.4f}, {cc[1]:.4f}]  mean {mc:.4f}")
     print("\n(* = 95% CI excludes 0.  Negative => collapse hurts.  Watch coverage:")
-    print(" if covA/covC fall well below 0.90 at H=40, that is the predicted")
-    print(" mode-blind under-dispersion.)")
+    print(" covA/covC well below 0.90 at H=20-40 is the predicted under-dispersion.)")
     print(f"\n[gp_blind done in {time.time()-t0:.0f}s]")
 
 
-
-    print(" if covA/covC fall well below 0.90 at H=40, that is the predicted")
-    print(" mode-blind under-dispersion.)")
-    print(f"\n[gp_blind done in {time.time()-t0:.0f}s]")
