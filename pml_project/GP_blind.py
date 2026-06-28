@@ -231,28 +231,29 @@ purely 'initial state coupled to its mode vs collapsed', through identical dynam
 """
 
 def score_blind(c, gps, transform, noise, horizons, n_part, seed):
-    """Arms A/C with common random numbers (shared function draws + noise +
-    init normals); only the initial state distribution differs."""
+    """Three arms for structural parity with oracle/aware. The blind rollout
+    IGNORES the mode, so mix_coupled (state coupled, mode coupled) and mix
+    (state coupled, mode independent) propagate IDENTICALLY -- mix_coupled is
+    degenerate here and should coincide with mix up to MC noise. We compute it
+    anyway as an explicit check. Only mix - collapse (state-collapse cost) is
+    informative under the blind propagator."""
     post, T, truth = c["post"], c["T"], c["truth"]
-    paths = draw_paths_blind(gps, n_part, seed + 99)      # shared A/C
+    paths = draw_paths_blind(gps, n_part, seed + 99)
     si, sr = seed, seed + 1
     rolls = {}
-    for arm in ("A", "C"):
+    for arm in ("mix", "collapse", "mix_coupled"):
         xs, _ = R.init_particles(post, arm, n_part, np.random.default_rng(si))
         rolls[arm] = blind_rollout(xs, T, horizons, gps, transform, paths, noise,
                                    np.random.default_rng(sr))
     res = {}
     for h in horizons:
         yh = truth[h]
-        res[h] = dict(
-            d=R.crps_position(rolls["A"][h], yh) - R.crps_position(rolls["C"][h], yh),
-            covA=R.coverage_position(rolls["A"][h], yh, 0.9),
-            covC=R.coverage_position(rolls["C"][h], yh, 0.9),
-            shpA=R.sharpness_position(rolls["A"][h], 0.9),
-            shpC=R.sharpness_position(rolls["C"][h], 0.9))
+        res[h] = {arm: dict(
+            crps=R.crps_position(rolls[arm][h], yh),
+            cov=R.coverage_position(rolls[arm][h], yh, 0.9),
+            shp=R.sharpness_position(rolls[arm][h], 0.9))
+            for arm in ("mix", "collapse", "mix_coupled")}
     return res
-
-
 
 # ================================ main ================================
 
@@ -262,8 +263,6 @@ if __name__ == "__main__":
     print("=" * 70)
     print("GP-PROPAGATOR EXPERIMENT  --  mode-BLIND (the proposal's GP)")
     print("=" * 70)
-    print("One SVGP per velocity component; mode is NOT an input. A null at long")
-    print("horizon is INFORMATIVE (predicted GP under-dispersion may swamp it).\n")
 
     print(f"Training 2 mode-blind SVGPs (M={M_IND}, steps={STEPS}, batch={BATCH})...")
     Ztr, DVtr = make_training_data_blind()
@@ -273,6 +272,7 @@ if __name__ == "__main__":
     noise = estimate_noise_blind(gps, transform, Ztr, DVtr)
     print(f"\nrollout process-noise eta (data-driven): x={noise[0]:.4f}, y={noise[1]:.4f}\n")
 
+    ARMS = ("mix", "collapse", "mix_coupled")
     rng = np.random.default_rng(404)
     cands = E.collect_origins(rng)
     strat = E.stratify(cands, rng)
@@ -281,42 +281,50 @@ if __name__ == "__main__":
     for name, _, _ in E.STRATA:
         print(f"  {name:>4}: {len(strat[name])} origins "
               f"({len({c['sid'] for c in strat[name]})} unique seqs)")
-    print(f"{'stratum':>6} {'n':>4} {'H':>4} {'mean dCRPS (A-C)':>18} "
-          f"{'95% CI':>22} {'covA':>6} {'covC':>6} {'shpA':>7} {'shpC':>7}")
-    for name, _, _ in E.STRATA:
-        acc = {h: {"d": [], "covA": [], "covC": [], "shpA": [], "shpC": [],
-                   "sid": []} for h in HORIZONS}
+
+    results = {name: {h: {arm: {"crps": [], "cov": [], "shp": []} for arm in ARMS}
+                      for h in HORIZONS} for name, _, _ in E.STRATA}
+    sids = {name: [] for name, _, _ in E.STRATA}
+
+    for name in results:
         for k, c in enumerate(strat[name]):
             r = score_blind(c, gps, transform, noise, HORIZONS, N_PART, seed=7 * k + 1)
+            sids[name].append(c["sid"])
             for h in HORIZONS:
-                acc[h]["d"].append(r[h]["d"])
-                acc[h]["covA"].append(r[h]["covA"])
-                acc[h]["covC"].append(r[h]["covC"])
-                acc[h]["shpA"].append(r[h]["shpA"])
-                acc[h]["shpC"].append(r[h]["shpC"])
-                acc[h]["sid"].append(c["sid"])
+                for arm in ARMS:
+                    results[name][h][arm]["crps"].append(r[h][arm]["crps"])
+                    results[name][h][arm]["cov"].append(r[h][arm]["cov"])
+                    results[name][h][arm]["shp"].append(r[h][arm]["shp"])
+
+    print(f"\n{'stratum':>6} {'n':>4} {'H':>4} "
+          f"{'CRPS_mix':>9} {'CRPS_col':>9} {'dCRPS':>10} {'95% CI':>22} "
+          f"{'cov_m':>6} {'cov_c':>6} {'shp_m':>7} {'shp_c':>7}")
+    for name, lo, hi in E.STRATA:
         for h in HORIZONS:
-            m, ci = E.paired_bootstrap(acc[h]["d"])
+            cm = results[name][h]["mix"]["crps"]
+            cc = results[name][h]["collapse"]["crps"]
+            d = [a - b for a, b in zip(cm, cc)]
+            m, ci = E.paired_bootstrap(d)
             sig = "*" if (ci[1] < 0 or ci[0] > 0) else " "
-            print(f"{name:>6} {len(acc[h]['d']):>4} {h:>4} {m:>17.4f}{sig} "
+            print(f"{name:>6} {len(d):>4} {h:>4} "
+                  f"{np.mean(cm):>9.4f} {np.mean(cc):>9.4f} {m:>9.4f}{sig} "
                   f"[{ci[0]:>8.4f},{ci[1]:>8.4f}] "
-                  f"{np.mean(acc[h]['covA']):>6.2f} {np.mean(acc[h]['covC']):>6.2f} "
-                  f"{np.mean(acc[h]['shpA']):>7.2f} {np.mean(acc[h]['shpC']):>7.2f}")
-        if name == "high" and 20 in acc:
-            mc, cc = E.cluster_bootstrap(acc[20]["d"], acc[20]["sid"])
-            print(f"   -> PRIMARY (high, H=20) cluster 95% CI "
-                  f"[{cc[0]:.4f}, {cc[1]:.4f}]  mean {mc:.4f}")
-            dev = [abs(a - 0.9) - abs(cc_ - 0.9)
-                   for a, cc_ in zip(acc[20]["covA"], acc[20]["covC"])]
-            dshp = [a - s for a, s in zip(acc[20]["shpA"], acc[20]["shpC"])]
-            mdev, cidev = E.paired_bootstrap(dev)
-            msh, cish = E.paired_bootstrap(dshp)
-            print(f"      calib. deviation A-C = {mdev:+.4f} [{cidev[0]:+.4f},{cidev[1]:+.4f}]")
-            print(f"      sharpness A-C        = {msh:+.4f} [{cish[0]:+.4f},{cish[1]:+.4f}]")
-    print("\n(* = 95% CI excludes 0.  Negative => collapse hurts.  Watch coverage:")
-    print(" covA/covC well below 0.90 at H=20-40 is the predicted under-dispersion.)")
+                  f"{np.mean(results[name][h]['mix']['cov']):>6.2f} "
+                  f"{np.mean(results[name][h]['collapse']['cov']):>6.2f} "
+                  f"{np.mean(results[name][h]['mix']['shp']):>7.2f} "
+                  f"{np.mean(results[name][h]['collapse']['shp']):>7.2f}")
+    print(f"\n(* = 95% CI excludes 0.)")
+
+    hi_arm = results["high"][20]
+    cm, cc, cf = (hi_arm["mix"]["crps"], hi_arm["collapse"]["crps"],
+                  hi_arm["mix_coupled"]["crps"])
+    mn, ci_n = E.paired_bootstrap([a - b for a, b in zip(cm, cc)])
+    print(f"\nPRIMARY (high, H=20): state collapse under mode-blind")
+    print(f"  mix - collapse = {mn:+.4f}  [{ci_n[0]:+.4f},{ci_n[1]:+.4f}]")
+    # degeneracy check: mix_coupled should equal mix (blind ignores mode)
+    deg = np.mean([a - b for a, b in zip(cf, cm)])
+    print(f"  degeneracy check  mix_coupled - mix = {deg:+.5f}  (should be ~0: blind has no mode)")
     print(f"\n[gp_blind done in {time.time()-t0:.0f}s]")
 
-    
 
 
