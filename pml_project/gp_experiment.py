@@ -11,7 +11,7 @@ import rollout as R
 import gp_rollout as G
 import experiment as E   
 
-N_SEQ = 150
+N_SEQ = 2000
 TARGET = 100
 N_PART = 2000
 HORIZONS = [5, 20, 40]
@@ -85,5 +85,7 @@ if __name__ == "__main__":
                   f"({len(set(sid_h[20]))} unique seqs)")
     print(f"\n(* = 95% CI excludes 0.  Negative => collapse hurts.)")
     print(f"elapsed {time.time()-t0:.0f}s")
+
+
 
 
