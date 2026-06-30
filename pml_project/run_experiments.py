@@ -27,7 +27,9 @@ STEPS = [
 
 def main():
     t_all = time.time()
-    env = dict(os.environ, PYTHONWARNINGS="ignore")   # silenzia i warning torch/gpytorch
+    log_dir = os.path.join(HERE, "logs")
+    os.makedirs(log_dir, exist_ok=True)
+    env = dict(os.environ, PYTHONWARNINGS="ignore")
     results = []
     for i, (label, fname) in enumerate(STEPS, 1):
         path = os.path.join(HERE, fname)
@@ -38,12 +40,19 @@ def main():
             print(f"!! FILE MANCANTE: {fname} -- saltato", flush=True)
             results.append((label, "MANCANTE", 0.0))
             continue
+        log_path = os.path.join(log_dir, fname.replace(".py", ".log"))
         t0 = time.time()
-        ret = subprocess.run([sys.executable, path], cwd=HERE, env=env)  # stream live
+        with open(log_path, "w") as log_file:
+            ret = subprocess.run(
+                [sys.executable, path], cwd=HERE, env=env,
+                stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+            log_file.write(ret.stdout)
+            print(ret.stdout, end="", flush=True)
         dt = time.time() - t0
         status = "OK" if ret.returncode == 0 else f"ERRORE (exit {ret.returncode})"
         results.append((label, status, dt))
         print(f"\n--- {label}: {status} in {dt:.0f}s ---", flush=True)
+        print(f"    log salvato in: logs/{fname.replace('.py', '.log')}", flush=True)
 
     print("\n\n" + "#" * 78)
     print("RIEPILOGO")
@@ -51,8 +60,10 @@ def main():
     for label, status, dt in results:
         print(f"  [{status:>16}]  {dt:6.0f}s  {label}")
     print(f"\nTotale: {time.time() - t_all:.0f}s")
+    print(f"Log salvati in: {log_dir}")
 
 
 if __name__ == "__main__":
     main()
+
 
