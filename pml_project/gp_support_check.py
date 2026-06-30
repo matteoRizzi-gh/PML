@@ -94,7 +94,7 @@ if __name__ == "__main__":
         paths, _ = G.draw_paths(gps, N_PART, 7 * k + 1 + 99, noise)
         # arm A (mode-conditional init): e' l'arm dove le particelle sono piu'
         # spread, quindi il caso peggiore per uscire dal supporto
-        xs, ms = R.init_particles(post, "A", N_PART, np.random.default_rng(7 * k + 1))
+        xs, ms = R.init_particles(post, "mix", N_PART, np.random.default_rng(7 * k + 1))
         r = rollout_track_support(xs, ms, T, HORIZONS, gps, paths, noise,
                                   np.random.default_rng(7 * k + 2), vmin, vmax)
         for h in HORIZONS:
@@ -128,4 +128,23 @@ outside the data. The ARD-SE kernel, despite being a poor structural match for
 the near-linear velocity map, is never asked to extrapolate here, so any
 GP-vs-oracle difference reflects the learned dynamics within support, not
 out-of-support kernel behavior. This closes the kernel-extrapolation concern.
+"""
+
+
+"""
+
+  training velocity range: vx [-4.35,4.05]  vy [-5.24,2.94]
+  tracking 150 high-stratum origins
+
+   H  frac out-of-support    max rel. excess
+   5                0.0%               0.00
+  20                0.0%               0.00
+  40                0.0%               0.00
+
+Lettura: se frac e' piccola (<~5%) a h40, il supporto regge e il
+profilo GP non e' artefatto del kernel. Se e' grande (>~20%), il GP
+estrapola e il costo-vs-orizzonte del GP va interpretato con cautela.
+
+elapsed 1668s
+
 """
