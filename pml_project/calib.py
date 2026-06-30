@@ -61,6 +61,7 @@ def terminal_accuracy(sigma_r, seed):
     rng = np.random.default_rng(seed)
     correct = 0
     n_high = 0
+
     for _ in range(N_PILOT):
         T = int(rng.integers(ORIGIN_LO, ORIGIN_HI + 1))
         modes, x = slds.simulate(T, rng)
@@ -68,16 +69,19 @@ def terminal_accuracy(sigma_r, seed):
         mu, *_ = slds.run_imm(y, sigma_r)
         correct += int(mu.argmax() == modes[-1])
         n_high += int(entropy(mu) >= 0.75)
+
     return correct / N_PILOT, n_high / N_PILOT
 
 if __name__ == "__main__":
     t0 = time.time()
     print(f"{'sigma_r':>8} {'term_acc':>9} {'frac_high':>10}")
     accs = {}
+
     for s in GRID:
         a, fh = terminal_accuracy(s, seed=12345)
         accs[s] = a
         print(f"{s:>8} {a:>9.3f} {fh:>10.3f}")
+        
     print(f"elapsed {time.time()-t0:.1f}s")
 
 
