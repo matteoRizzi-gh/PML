@@ -34,19 +34,19 @@ Sample N particles:
         mode-state coupling destroyed
 Same seed (Common Random Number setup)
 """
-
+"""Draw N particles. Fixed randomness order so all arms stay paired:
+    1. j        ~ Cat(mu)       component labels
+    2. z        ~ N(0, I_4)     shared init normals
+    3. m_indep  ~ Cat(mu)       independent propagation mode
+Every arm draws all three (even if unused) so j, z, m_indep are IDENTICAL
+across arms. What each USES:
+  'mix'         : state from component j; propagate under independent mode.
+  'collapse'    : state from moment-matched Gaussian; SAME independent mode.
+                  mix - collapse = cost of collapsing the STATE posterior.
+  'mix_coupled' : state from component j; propagate under j (coupled mode).
+                  mix_coupled - mix = cost of losing mode-state coupling."""
 def init_particles(post, arm, N, rng):
-    """Draw N particles. Fixed randomness order so all arms stay paired:
-        1. j        ~ Cat(mu)       component labels
-        2. z        ~ N(0, I_4)     shared init normals
-        3. m_indep  ~ Cat(mu)       independent propagation mode
-    Every arm draws all three (even if unused) so j, z, m_indep are IDENTICAL
-    across arms. What each USES:
-      'mix'         : state from component j; propagate under independent mode.
-      'collapse'    : state from moment-matched Gaussian; SAME independent mode.
-                      mix - collapse = cost of collapsing the STATE posterior.
-      'mix_coupled' : state from component j; propagate under j (coupled mode).
-                      mix_coupled - mix = cost of losing mode-state coupling."""
+
     mu, xhat, Phat, xbar, Pbar = post
     j = rng.choice(3, size=N, p=mu)
     z = rng.standard_normal((N, 4))
@@ -68,27 +68,6 @@ def init_particles(post, arm, N, rng):
     return x, m
 
 
-'''
-primary = mix_coupled - mix
-
-
-def init_particles(post, arm, N, rng):
-    """Draw N particles for the given arm. Consumes randomness in a fixed
-    order (component labels, then init normals) so arms A and C are paired."""
-    mu, xhat, Phat, xbar, Pbar = post
-    j = rng.choice(3, size=N, p=mu)            # shared component labels
-    z = rng.standard_normal((N, 4))            # shared init normals
-    if arm == "A":
-        L = _chol_batch(Phat)                  # (3,4,4)
-        x = xhat[j] + np.einsum("nij,nj->ni", L[j], z)
-    elif arm == "C":
-        Lb = _chol_batch(Pbar[None])[0]
-        x = xbar + z @ Lb.T
-    else:
-        raise ValueError(arm)
-    return x, j.copy()                         # state (N,4), mode (N,)
-
-'''
 
 """
 Propagation. At each step:
@@ -104,11 +83,11 @@ A-C isolate exactly the effect of the initial coupling
 """
 
 def oracle_rollout(x, modes, T, horizons, rng):
-    """Propagate particles with the TRUE switching dynamics from absolute time
-    T. Returns {h: positions (N,2)} for each requested horizon h."""
+    """Propagate particles with the TRUE switching dynamics from absolute time T"""
     hmax = max(horizons)
     hset = set(horizons)
     out = {}
+
     for step in range(hmax):
         t = T + step                           # transition t -> t+1, mode = m_t
         pos, vel = x[:, :2], x[:, 2:]
@@ -128,7 +107,7 @@ def oracle_rollout(x, modes, T, horizons, rng):
         modes = (u[:, None] > np.cumsum(Prow, axis=1)).sum(1)
         h = step + 1
         if h in hset:
-            out[h] = x[:, :2].copy()
+            out[h] = x.copy()                 # full state (N,4)
     return out
 
 
@@ -141,6 +120,7 @@ We need to check wheter the true value fall inside of this interval.
 
 CRPS measures quality, while Coverage measure calibration.
 """
+
 def crps_position(samples_pos, truth_pos):
     """Mean over the 2 position coords of the ensemble CRPS."""
     return float(np.mean([ps.crps_ensemble(truth_pos[d], samples_pos[:, d])
@@ -157,9 +137,7 @@ def coverage_position(samples_pos, truth_pos, level):
     return float(np.mean(hits))
 
 
-# ----------------------------------------------------------------------
 # Closed-form H=1 predictive (for validation)
-# ----------------------------------------------------------------------
 
 """
 External validation. At H=1 the forecast is a closed form Gaussian Mixture 
@@ -170,22 +148,23 @@ We obtain mean A_j x_hat^j + c_j and covarianc eA_j P^j A_j^T + Q_j
 
 """
 def closed_form_h1(post, arm, T):
-    """Exact position predictive of x_{T+1} as a 3-component Gaussian mixture.
-    Arm A uses mode-conditional (xhat^j, Phat^j); arm C uses (xbar, Pbar)."""
+    """Exact position predictive of x_{T+1} as a 3-component Gaussian mixture"""
     mu, xhat, Phat, xbar, Pbar = post
     means, covs = [], []
+
     for j in range(3):
         Aj, Qj = A_MATS[j], Q_MATS[j]
         cj = np.zeros(4)
         if j == 2:
             cj[2:] = slds.forcing_u(T)
-        if arm == "A":
+        if arm in ("mix", "mix_coupled"):
             mj = Aj @ xhat[j] + cj
             Cj = Aj @ Phat[j] @ Aj.T + Qj
-        else:
+        else:                               # collapse
             mj = Aj @ xbar + cj
             Cj = Aj @ Pbar @ Aj.T + Qj
         means.append(mj[:2]); covs.append(Cj[:2, :2])
+
     means = np.array(means); covs = np.array(covs)
     mbar = (mu[:, None] * means).sum(0)
     Cbar = sum(mu[j] * (covs[j] + np.outer(means[j] - mbar, means[j] - mbar))
@@ -194,10 +173,6 @@ def closed_form_h1(post, arm, T):
 
 
 def sharpness_position(samples_pos, level):
-    """Mean width of the central (level) interval, averaged over the 2 position
-    coords. Reported jointly with coverage: a model can hit nominal coverage by
-    widening intervals, so width is the necessary complement. Per-coord so the
-    paired difference A-C is well-defined, same as coverage."""
     lo = (1 - level) / 2
     widths = []
     for d in range(2):
@@ -205,8 +180,99 @@ def sharpness_position(samples_pos, level):
         widths.append(q[1] - q[0])
     return float(np.mean(widths))
 
+
+# Velocity CRPS
+
+def crps_velocity(samples_state, truth_vel):
+    """Mean over the 2 velocity components of the ensemble CRPS"""
+    samples_vel = samples_state[:, 2:]          # (N, 2)
+    return float(np.mean([ps.crps_ensemble(truth_vel[d], samples_vel[:, d])
+                          for d in range(2)]))
+
+
+# PIT / rank histogram
+
+def pit_rank(samples_1d, truth_1d, rng):
+
+    S = len(samples_1d)
+    n_below = int(np.sum(samples_1d < truth_1d))
+    n_equal = int(np.sum(samples_1d == truth_1d))
+    if n_equal == 0:
+        return n_below
+    # random tie-breaking: distribute ties uniformly
+    return n_below + int(rng.integers(0, n_equal + 1))
+
+
+def pit_ranks_origin(samples_state, truth_pos, truth_vel, rng):
+    """Compute PIT ranks for one origin at one horizon"""
+    names = ["px", "py", "vx", "vy"]
+    truth = np.concatenate([truth_pos, truth_vel])   # (4,)
+    return {name: pit_rank(samples_state[:, d], truth[d], rng)
+            for d, name in enumerate(names)}
+
+
+def pit_histogram(ranks, n_particles, n_bins=10):
+    """Build a normalised rank histogram from a list of integer ranks """
+    ranks = np.asarray(ranks)
+    edges = np.linspace(0, n_particles + 1, n_bins + 1)
+    counts, _ = np.histogram(ranks, bins=edges)
+    return edges, counts / counts.sum()
+
+
+# Energy score (multivariate generalisation of CRPS)
+def energy_score(samples, truth):
+
+    """Energy score for a multivariate ensemble forecast.
+
+    ES(F, y) = E||X - y|| - 0.5 * E||X - X'||
+    where X, X' are independent draws from the forecast distribution F
+    and ||.|| is the Euclidean norm.
+
+    Estimated from S particles via the unbiased U-statistic:
+        ES = (1/S) sum_i ||x_i - y||
+           - (1 / (2 * S*(S-1))) sum_{i != j} ||x_i - x_j||
+
+    Works for any dimension k (position k=2, velocity k=2, full state k=4).
+    The second term uses the O(S^2) pairwise distance — feasible for S<=2000.
+
+    Note: the proposal explicitly EXCLUDED the energy score from primary
+    endpoints (Section 7: "weakly sensitive to dependence structure, costly,
+    no discriminative gain"). It is included here as an optional diagnostic
+    only; the primary endpoint remains CRPS on position components.
+
+    samples : (S, k)  ensemble particles
+    truth   : (k,)    true value
+    Returns a scalar float.
+    """
+    
+    samples = np.asarray(samples)           # (S, k)
+    truth   = np.asarray(truth)             # (k,)
+    S = samples.shape[0]
+    # first term: mean distance to truth
+    term1 = np.mean(np.linalg.norm(samples - truth, axis=1))
+    # second term: mean pairwise distance (U-statistic, excludes i==j)
+    # use broadcasting: (S,1,k) - (1,S,k) -> (S,S,k)
+    diff = samples[:, None, :] - samples[None, :, :]    # (S,S,k)
+    pw = np.linalg.norm(diff, axis=2)                   # (S,S)
+    # sum off-diagonal, divide by S*(S-1)
+    term2 = (pw.sum() - np.diag(pw).sum()) / (S * (S - 1))
+    return float(term1 - 0.5 * term2)
+
+
+def energy_score_position(samples_state, truth_pos):
+
+    return energy_score(samples_state[:, :2], truth_pos)
+
+
+def energy_score_velocity(samples_state, truth_vel):
+
+    return energy_score(samples_state[:, 2:], truth_vel)
+
+
+# VALIDATION: particle rollout vs closed form at H=1 
+
 if __name__ == "__main__":
-    # ---- VALIDATION: particle rollout vs closed form at H=1 ----
+    
     rng = np.random.default_rng(0)
     modes, x = slds.simulate(200, rng)
     y = slds.observe(x, 0.05, rng)
@@ -216,7 +282,8 @@ if __name__ == "__main__":
     print(f"H=1 validation (N={N} particles), origin T={T}:")
     for arm in ("mix", "collapse"):
         xs, ms = init_particles(post, arm, N, np.random.default_rng(7))
-        pos1 = oracle_rollout(xs, ms, T, [1], np.random.default_rng(7))[1]
+        state1 = oracle_rollout(xs, ms, T, [1], np.random.default_rng(7))[1]
+        pos1 = state1[:, :2]               # slice position from full state (N,4)
         emp_m, emp_C = pos1.mean(0), np.cov(pos1.T)
         cf_m, cf_C = closed_form_h1(post, arm, T)
         print(f"  arm {arm}: |mean err| {np.abs(emp_m-cf_m).max():.4f}  "
@@ -226,33 +293,26 @@ if __name__ == "__main__":
 
 
 """
-TODO -- open items, in priority order.
+STATUS (aggiornato).
 
-DECISION FIRST (blocks everything): pick the headline.
-  (1) "collapsing the STATE posterior is benign" -- primary = mix - collapse ~ 0,
-      explained by observed position + velocity-only separation; OR
-  (2) "the cost is in the mode-state COUPLING" -- primary = mix_coupled - mix
-      (~ -0.025, significant), with the decomposition showing state ~ 0.
-  Both are defensible but they are DIFFERENT theses; one must be the headline.
+FATTO:
+  - tre bracci: mix, collapse, mix_coupled con CRN corretto
+  - oracle_rollout restituisce stato completo (N,4)
+  - crps_position, crps_velocity, energy_score (pos/vel)
+  - pit_rank, pit_ranks_origin, pit_histogram
+  - closed_form_h1 con naming corretto (mix/mix_coupled/collapse)
+  - validazione H=1 corretta con slice [:, :2]
 
-NOT YET RUN:
-  - aware + blind at three arms. Code is ready, output is not. Needed to check
-    whether the oracle decomposition (state ~ 0, coupling != 0) survives under
-    learned dynamics. Blind: mix_coupled must coincide with mix (no mode) --
-    degeneracy check.
+RISULTATO PRINCIPALE (oracle, high stratum, H=20):
+  state collapse   (mix - collapse)        = -0.0012  [-0.0040, +0.0015]  -> NULL
+  coupling loss    (mix_coupled - mix)     = -0.0247  [-0.0495, +0.0003]  -> il vero costo
+  total            (mix_coupled - collapse)= -0.0259  [-0.0517, -0.0007]
+  additivity: state + coupling = total (diff 0.0000), esatta.
 
-NOT YET DONE (completeness vs the plan):
-  - velocity-space scoring: re-score CRPS on velocity instead of position.
-    Expected NEGATIVE and significant where position is null -- would show the
-    collapse cost the theory predicts lives in velocity, closing the
-    theory-vs-result loop. Highest-value missing piece for either headline.
-  - H=2 exact validation (3^2 = 9 closed-form components): the only check that
-    tests pathwise COHERENCE along the trajectory; current H=1 validation does
-    not (marginal == coherent at H=1). 
-  - PIT / rank histograms: third evaluation metric, never produced.
-
-OBSOLETE (built on the buggy result, discard or redo):
-  - the grow-then-decay vs plateau horizon discussion, and the sharpness
-    "reachable-space" story -- both described the coupling effect, not the
-    state collapse, since state collapse is null.
+MANCA ANCORA:
+  - H=2 exact validation (3^2=9 componenti): testa la coerenza pathwise
+    lungo la traiettoria; la validazione H=1 non la copre.
+  - energy score da integrare in experiment.py (funzione qui presente,
+    da aggiungere a score_origin e al loop di raccolta risultati).
+  - gp_support_check.py: arm "A" -> "mix" (crasherebbe a runtime).
 """
