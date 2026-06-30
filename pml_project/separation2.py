@@ -66,22 +66,26 @@ def sep_and_kl(mu, xhat, Phat, xbar, Pbar, idx, rng):
     S = Phat[:, idx][:, :, idx]               # (3,k,k)
     mq = xbar[idx]; Sq = Pbar[np.ix_(idx, idx)]
     k = len(idx)
+
     # separation ratio
     s = np.sqrt(np.mean([np.trace(S[j]) / k for j in range(3)]))
     dmax = max(np.linalg.norm(m[i] - m[j])
                for i in range(3) for j in range(i + 1, 3))
     sep = dmax / s
+
     # KL(mixture||collapse) via MC
     comp = rng.choice(3, size=N_MC, p=mu)
     z = np.empty((N_MC, k))
     chols = [np.linalg.cholesky(S[j] + 1e-10 * np.eye(k)) for j in range(3)]
+
     for j in range(3):
         sel = comp == j; n = int(sel.sum())
         if n:
             z[sel] = m[j] + rng.standard_normal((n, k)) @ chols[j].T
-    logp = np.logaddexp.reduce(
-        np.stack([np.log(mu[j]) + logN(z, m[j], S[j]) for j in range(3)]), 0)
+
+    logp = np.logaddexp.reduce(np.stack([np.log(mu[j]) + logN(z, m[j], S[j]) for j in range(3)]), 0)
     logq = logN(z, mq, Sq)
+
     return sep, float(np.mean(logp - logq))
 
 """
@@ -95,6 +99,7 @@ def run():
     rng = np.random.default_rng(2024)
     data = {name: {"H": [], "sep": [], "kl": []} for name in SUBSPACES}
     Hs_all = []
+
     for _ in range(N_SEQ):
         modes, x = slds.simulate(SEQ_LEN, rng)
         y = slds.observe(x, SIGMA_R, rng)
@@ -107,6 +112,7 @@ def run():
                 data[name]["H"].append(H)
                 data[name]["sep"].append(sep)
                 data[name]["kl"].append(kl)
+                
     for name in SUBSPACES:
         for key in data[name]:
             data[name][key] = np.array(data[name][key])
