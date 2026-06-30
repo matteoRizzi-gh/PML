@@ -84,11 +84,12 @@ grid also brackets but which do NOT drive the paired contrast:
  1/(1-0.95) = 20, mode-marginal relaxation time -1/ln(0.925) ~ 13. These
  describe one chain's marginal, not the decay of the A-C cost.)
 """
+
+
 import numpy as np
 
-# ----------------------------------------------------------------------
-# Fixed benchmark parameters. Do not tune.
-# ----------------------------------------------------------------------
+# Fixed benchmark parameters
+
 DT = 1.0
 N_MODES = 3
 F_DIAG = np.array([1.0, 0.9, 1.0])          # F_m = f_m * I_2
@@ -114,7 +115,7 @@ _Q: process noise, it enters only in the velocity
 
 """
 def _A(mode):
-    """State-transition matrix for a given mode (0-indexed)."""
+    """State-transition matrix for a given mode"""
     f = F_DIAG[mode]
     return np.array([[1.0, 0, DT, 0],
                      [0, 1.0, 0, DT],
@@ -123,7 +124,7 @@ def _A(mode):
 
 
 def _Q(mode):
-    """Process-noise covariance: noise enters velocity only -> singular in p."""
+    """Process-noise covariance"""
     s2 = SIGMA[mode] ** 2
     return np.diag([0.0, 0.0, s2, s2])
 
@@ -135,13 +136,13 @@ clearly it depends on t and not the horizon.
 This is fundamental to allineate times in the filter and in the rollout
 """
 def forcing_u(t):
-    """Control vector c3(t) at absolute time t (the mode-3 forcing)."""
+    """forcing vector"""
     return A_F * np.array([np.sin(OMEGA * t), np.cos(OMEGA * t)])
 
 
-# ----------------------------------------------------------------------
+
 # Simulator
-# ----------------------------------------------------------------------
+
 """
 Generate a real sequence:
     - Initial state: position 0, velocity drawn from N(0, (0.5)^2)
@@ -152,14 +153,14 @@ Generate a real sequence:
 """
 def simulate(T, rng):
     """
-    Generate one sequence of length T+1 (times 0..T).
-    Returns modes (T+1,), states (T+1, 4), observations (T+1, 2).
+    Generate one sequence of length T+1
     """
     modes = np.empty(T + 1, dtype=int)
     x = np.empty((T + 1, 4))
     modes[0] = rng.integers(N_MODES)
     v0 = rng.normal(0.0, 0.5, size=2)
     x[0] = np.array([0.0, 0.0, v0[0], v0[1]])
+
     for t in range(T):
         m = modes[t]
         c = np.zeros(4)
@@ -169,21 +170,19 @@ def simulate(T, rng):
         w[2:] = rng.normal(0.0, SIGMA[m], size=2)
         x[t + 1] = _A(m) @ x[t] + c + w
         modes[t + 1] = rng.choice(N_MODES, p=PI[m])
+
     return modes, x
 
-"""
-We add Gaussian noise to the position.
-sigma_r is the only free parameter 
-"""
+
 def observe(x, sigma_r, rng):
-    """Noisy position observations y = H x + r, r ~ N(0, sigma_r^2 I)."""
+    """We add Gaussian noise to the position"""
     pos = x[:, :2]
     return pos + rng.normal(0.0, sigma_r, size=pos.shape)
 
 
-# ----------------------------------------------------------------------
-# IMM filter (filterpy KFs + per-mode control)
-# ----------------------------------------------------------------------
+
+# IMM filter 
+
 """
 We build the IMM as 3 Kalman filter (one each mode), all of them with independent F; Q; H; R= (sigma_r)^2 * I
 
@@ -213,7 +212,7 @@ def _build_imm(sigma_r):
         kf.R = R.copy()
         kf.B = B3 if m == 2 else B0
         kf.x = np.zeros(4)
-        kf.P = np.diag([1.0, 1.0, 0.5, 0.5])   # washed out long before origins
+        kf.P = np.diag([1.0, 1.0, 0.5, 0.5])   
         filters.append(kf)
     mu0 = np.full(N_MODES, 1.0 / N_MODES)       # m0 ~ Uniform
     return IMMEstimator(filters, mu0, PI)
@@ -240,45 +239,44 @@ P_bar =sum_j mu_j * [P^j + ((x_hat)^j - x_bar) * (x_hat)^j - x_bar)^T]
 """
 def run_imm(y, sigma_r):
     """
-    Run the IMM over observations y (times 0..T).
-
+    Run the IMM over observations y 
     """
     imm = _build_imm(sigma_r)
     Tn = y.shape[0] - 1
     mu_trace = np.empty((Tn + 1, N_MODES))
     imm.update(y[0])
     mu_trace[0] = imm.mu.copy()
+
     for t in range(1, Tn + 1):
         imm.predict(u=forcing_u(t - 1))     # predict t-1 -> t uses forcing(t-1)
         imm.update(y[t])
         mu_trace[t] = imm.mu.copy()
+
     x_hat = np.array([f.x.copy() for f in imm.filters])
     P_hat = np.array([f.P.copy() for f in imm.filters])
+    
     return imm.mu.copy(), x_hat, P_hat, imm.x.copy(), imm.P.copy(), mu_trace
 
 
-"""
-Same IMM run but it only passes once and it saves snapshots of the posterior
-"""
+
 def run_imm_multi(y, sigma_r, origins):
     """
-    Single IMM pass over y (times 0..T_max); snapshot the posterior at each
-    requested origin time. Much cheaper than re-running per origin.
-
-    Returns a dict: origin -> (mu, x_hat, P_hat, x_bar, P_bar).
-    origins must be sorted ascending and within [0, len(y)-1].
+    Same IMM run but it only passes once and it saves snapshots of the posterior
     """
     imm = _build_imm(sigma_r)
     want = sorted(int(o) for o in origins)
     out = {}
     imm.update(y[0])
+
     if want and want[0] == 0:
         out[0] = (imm.mu.copy(),
                   np.array([f.x.copy() for f in imm.filters]),
                   np.array([f.P.copy() for f in imm.filters]),
                   imm.x.copy(), imm.P.copy())
+        
     Tmax = max(want)
     wset = set(want)
+
     for t in range(1, Tmax + 1):
         imm.predict(u=forcing_u(t - 1))
         imm.update(y[t])
@@ -287,5 +285,6 @@ def run_imm_multi(y, sigma_r, origins):
                       np.array([f.x.copy() for f in imm.filters]),
                       np.array([f.P.copy() for f in imm.filters]),
                       imm.x.copy(), imm.P.copy())
+            
     return out
 
