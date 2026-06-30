@@ -25,7 +25,7 @@ ORIGINS_PER_SEQ = 3       # diagnostic only (final test uses 1/seq)
 N_MC = 2000               # MC samples for KL
 LOG3 = np.log(3)
 
-# entropy bins from the proposal (+ the cut middle bin, restored for the curve)
+# entropy bins from the proposal
 BINS = [("low [0,0.35)", 0.0, 0.35),
         ("mid [0.35,0.75)", 0.35, 0.75),
         ("high [0.75,log3]", 0.75, LOG3 + 1e-9)]
@@ -85,6 +85,7 @@ def kl_collapse(mu, xhat, Phat, xbar, Pbar, rng):
     comp = rng.choice(3, size=N_MC, p=mu)
     z = np.empty((N_MC, 2))
     chols = [np.linalg.cholesky(S[j] + 1e-12 * np.eye(2)) for j in range(3)]
+
     for j in range(3):
         idx = comp == j
         n = int(idx.sum())
@@ -115,12 +116,11 @@ def kl_collapse(mu, xhat, Phat, xbar, Pbar, rng):
 
 """
 def run():
-    rng = np.random.default_rng(2024)       # held-out diagnostic seed
+    rng = np.random.default_rng(2024)    
     rows = []  # (H, sep, kl)
     for _ in range(N_SEQ):
         modes, x = slds.simulate(SEQ_LEN, rng)
         y = slds.observe(x, SIGMA_R, rng)
-        # one full IMM pass; read mode-conditional mixture at several origins
         Ts = rng.choice(range(ORIGIN_LO, ORIGIN_HI + 1),
                         size=ORIGINS_PER_SEQ, replace=False)
         for T in Ts:
@@ -129,6 +129,7 @@ def run():
             sep = sep_ratio(xh, Ph)
             kl = kl_collapse(mu, xh, Ph, xb, Pb, rng)
             rows.append((H, sep, kl))
+
     return np.array(rows)
 
 
