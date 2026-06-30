@@ -45,7 +45,7 @@ Build PER-MODE training sets from the TRUE simulator. The mode is known here
 and is used to GROUP the data by mode, this grouping is exactly what makes
 the propagator mode-aware. For each transition t -> t+1 record
     - input  phi_t = (vx_t, vy_t, sin(omega t), cos(omega t))
-    - target v_{t+1}                          
+    - target dv_t = v_{t+1} - v_t                        
 filed under m = modes[t]. 
 """
 
@@ -60,7 +60,7 @@ def make_training_data(K=300, T=200, per_mode=5000, seed=1):
             phi = np.array([x[t, 2], x[t, 3],
                             np.sin(slds.OMEGA * t), np.cos(slds.OMEGA * t)])
             feats[m].append(phi)
-            targs[m].append(x[t + 1, 2:])          # next velocity (2,)
+            targs[m].append(x[t + 1, 2:] - x[t, 2:])   # velocity increment dv (2,)
     data = {}
     for m in range(MODES):
         F = np.array(feats[m]); Y = np.array(targs[m])
@@ -110,8 +110,8 @@ def fit_all(data):
 
 
 def validate_fit(gps, data):
-    """Check GP posterior mean recovers the known velocity map on a grid."""
-    print("GP fit validation (RMSE of posterior mean vs true next-velocity map):")
+    """Check GP posterior mean recovers the known velocity increment map on a grid."""
+    print("GP fit validation (RMSE of posterior mean vs true dv map):")
     rng = np.random.default_rng(9)
     vgrid = rng.uniform(-2, 2, size=(400, 2))
     tgrid = rng.integers(0, 200, size=400)
@@ -126,7 +126,8 @@ def validate_fit(gps, data):
                 pred = gps[(m, d)].posterior(Pt).mean.squeeze(-1).numpy()
             c = (slds.A_F * (np.sin if d == 0 else np.cos)(slds.OMEGA * tgrid)
                  if m == 2 else 0.0)
-            true = slds.F_DIAG[m] * vgrid[:, d] + c
+            # true dv = v_{t+1} - v_t = (F_m - 1)*v + c
+            true = (slds.F_DIAG[m] - 1.0) * vgrid[:, d] + c
             rms.append(np.sqrt(np.mean((pred - true) ** 2)))
         print(f"  mode {m+1}: RMSE dim-x {rms[0]:.4f}  dim-y {rms[1]:.4f}  "
               f"(velocity scale ~{np.abs(vgrid).mean():.2f})")
@@ -193,7 +194,7 @@ def gp_rollout(x, modes, T, horizons, gps, paths, noise, rng):
         pos = pos + vel
         phi = _features(vel, t)
         Phi = torch.as_tensor(phi).unsqueeze(-2)        # (N,1,4) ensemble eval
-        vnew = np.empty_like(vel)
+        dv = np.empty_like(vel)
         for d in range(DIMS):
             cand = np.empty(N)
             for m in range(MODES):
@@ -201,14 +202,15 @@ def gp_rollout(x, modes, T, horizons, gps, paths, noise, rng):
                     g = paths[(m, d)](Phi).squeeze(-1).numpy()   # path i @ input i
                 sel = modes == m
                 cand[sel] = g[sel] + noise[(m, d)] * rng.standard_normal(sel.sum())
-            vnew[:, d] = cand
+            dv[:, d] = cand
+        vnew = vel + dv   # GP predicts increment dv; v_{t+1} = v_t + dv
         x = np.concatenate([pos, vnew], axis=1)
         Prow = slds.PI[modes]
         u = rng.random(N)
         modes = (u[:, None] > np.cumsum(Prow, axis=1)).sum(1)
         h = step + 1
         if h in hset:
-            out[h] = x[:, :2].copy()
+            out[h] = x.copy()          # full state (N,4); callers slice [:, :2] for position
     return out
 
 
