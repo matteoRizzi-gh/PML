@@ -218,7 +218,7 @@ def blind_rollout(x, T, horizons, gps, transform, paths, noise, rng):
         x = np.concatenate([pos, vel], axis=1)
         h = step + 1
         if h in hset:
-            out[h] = x[:, :2].copy()
+            out[h] = x.copy()          # full state (N,4); callers slice [:, :2] for position
     return out
 
 """
@@ -237,9 +237,11 @@ def score_blind(c, gps, transform, noise, horizons, n_part, seed):
     degenerate here and should coincide with mix up to MC noise. We compute it
     anyway as an explicit check. Only mix - collapse (state-collapse cost) is
     informative under the blind propagator."""
-    post, T, truth = c["post"], c["T"], c["truth"]
+    post, T, truth_pos, truth_vel = (c["post"], c["T"],
+                                     c["truth_pos"], c["truth_vel"])
     paths = draw_paths_blind(gps, n_part, seed + 99)
     si, sr = seed, seed + 1
+    pit_rng = np.random.default_rng(seed + 2)
     rolls = {}
     for arm in ("mix", "collapse", "mix_coupled"):
         xs, _ = R.init_particles(post, arm, n_part, np.random.default_rng(si))
@@ -247,12 +249,17 @@ def score_blind(c, gps, transform, noise, horizons, n_part, seed):
                                    np.random.default_rng(sr))
     res = {}
     for h in horizons:
-        yh = truth[h]
-        res[h] = {arm: dict(
-            crps=R.crps_position(rolls[arm][h], yh),
-            cov=R.coverage_position(rolls[arm][h], yh, 0.9),
-            shp=R.sharpness_position(rolls[arm][h], 0.9))
-            for arm in ("mix", "collapse", "mix_coupled")}
+        ypos = truth_pos[h]
+        yvel = truth_vel[h]
+        res[h] = {}
+        for arm in ("mix", "collapse", "mix_coupled"):
+            state = rolls[arm][h]           # (N, 4) full state
+            res[h][arm] = dict(
+                crps=R.crps_position(state[:, :2], ypos),
+                crps_vel=R.crps_velocity(state, yvel),
+                cov=R.coverage_position(state[:, :2], ypos, 0.9),
+                shp=R.sharpness_position(state[:, :2], 0.9),
+                pit=R.pit_ranks_origin(state, ypos, yvel, pit_rng))
     return res
 
 # ================================ main ================================
@@ -282,7 +289,10 @@ if __name__ == "__main__":
         print(f"  {name:>4}: {len(strat[name])} origins "
               f"({len({c['sid'] for c in strat[name]})} unique seqs)")
 
-    results = {name: {h: {arm: {"crps": [], "cov": [], "shp": []} for arm in ARMS}
+    results = {name: {h: {arm: {"crps": [], "cov": [], "shp": [],
+                                "crps_vel": [],
+                                "pit": {coord: [] for coord in ("px","py","vx","vy")}}
+                           for arm in ARMS}
                       for h in HORIZONS} for name, _, _ in E.STRATA}
     sids = {name: [] for name, _, _ in E.STRATA}
 
@@ -293,8 +303,12 @@ if __name__ == "__main__":
             for h in HORIZONS:
                 for arm in ARMS:
                     results[name][h][arm]["crps"].append(r[h][arm]["crps"])
+                    results[name][h][arm]["crps_vel"].append(r[h][arm]["crps_vel"])
                     results[name][h][arm]["cov"].append(r[h][arm]["cov"])
                     results[name][h][arm]["shp"].append(r[h][arm]["shp"])
+                    for coord in ("px", "py", "vx", "vy"):
+                        results[name][h][arm]["pit"][coord].append(
+                            r[h][arm]["pit"][coord])
 
     print(f"\n{'stratum':>6} {'n':>4} {'H':>4} "
           f"{'CRPS_mix':>9} {'CRPS_col':>9} {'dCRPS':>10} {'95% CI':>22} "
@@ -324,7 +338,148 @@ if __name__ == "__main__":
     # degeneracy check: mix_coupled should equal mix (blind ignores mode)
     deg = np.mean([a - b for a, b in zip(cf, cm)])
     print(f"  degeneracy check  mix_coupled - mix = {deg:+.5f}  (should be ~0: blind has no mode)")
+
+    # ---- velocity CRPS table ----
+    print(f"\n--- VELOCITY CRPS (mix - collapse, same structure as position) ---")
+    print(f"\n{'stratum':>6} {'n':>4} {'H':>4} "
+          f"{'vCRPS_mix':>10} {'vCRPS_col':>10} {'dvCRPS':>10} {'95% CI':>22}")
+    for name, lo, hi in E.STRATA:
+        for h in HORIZONS:
+            cm = results[name][h]["mix"]["crps_vel"]
+            cc = results[name][h]["collapse"]["crps_vel"]
+            d = [a - b for a, b in zip(cm, cc)]
+            m, ci = E.paired_bootstrap(d)
+            sig = "*" if (ci[1] < 0 or ci[0] > 0) else " "
+            print(f"{name:>6} {len(d):>4} {h:>4} "
+                  f"{np.mean(cm):>10.4f} {np.mean(cc):>10.4f} {m:>9.4f}{sig} "
+                  f"[{ci[0]:>8.4f},{ci[1]:>8.4f}]")
+    print(f"(* = 95% CI excludes 0.  Negative dvCRPS => collapse hurts in velocity.)")
+
+    # ---- PIT rank histograms ----
+    print(f"\n--- PIT RANK HISTOGRAMS (10 bins, uniform = calibrated) ---")
+    print(f"Flat histogram => well-calibrated. U-shape => under-dispersed.")
+    for name, lo, hi in E.STRATA:
+        for h in HORIZONS:
+            for arm in ("mix_coupled", "collapse"):
+                for coord in ("px", "py", "vx", "vy"):
+                    ranks = results[name][h][arm]["pit"][coord]
+                    _, freq = R.pit_histogram(ranks, N_PART, n_bins=10)
+                    bar = " ".join(f"{f:.2f}" for f in freq)
+                    print(f"  {name:>4} h={h:>2} {arm:>12} {coord}: [{bar}]")
+
     print(f"\n[gp_blind done in {time.time()-t0:.0f}s]")
 
 
+
+"""
+======================================================================
+GP-PROPAGATOR EXPERIMENT  --  mode-BLIND (the proposal's GP)
+======================================================================
+Training 2 mode-blind SVGPs (M=256, steps=3000, batch=1024)...
+ [comp 0] step    0 -loss = -50.3322
+ [comp 0] step  500 -loss = 0.7018
+ [comp 0] step 1000 -loss = 1.2856
+ [comp 0] step 1500 -loss = 1.2875
+ [comp 0] step 2000 -loss = 1.3226
+ [comp 0] step 2500 -loss = 1.3231
+ [comp 1] step    0 -loss = -50.2895
+ [comp 1] step  500 -loss = 0.7161
+ [comp 1] step 1000 -loss = 1.3273
+ [comp 1] step 1500 -loss = 1.2896
+ [comp 1] step 2000 -loss = 1.3738
+ [comp 1] step 2500 -loss = 1.3165
+  trained in 94s
+
+Mode-blind GP fit sanity (held-out):
+   comp     RMSE  resid-std  learned-noise  logdens/pt
+      x   0.0649     0.0649         0.0597       1.312
+      y   0.0659     0.0658         0.0623       1.300
+  (resid-std >> process sigma is EXPECTED: the mode-marginalized
+   spread the mode-blind GP cannot resolve. That is the design's point.)
+
+rollout process-noise eta (data-driven): x=0.0642, y=0.0639
+
+Mode-blind GP propagator (N_part=2000):
+   low: 150 origins (150 unique seqs)
+  high: 150 origins (150 unique seqs)
+
+stratum    n    H  CRPS_mix  CRPS_col      dCRPS                 95% CI  cov_m  cov_c   shp_m   shp_c
+   low  150    5    0.4265    0.4275   -0.0010* [ -0.0017, -0.0003]   0.72   0.74    1.60    1.61
+   low  150   20    5.1728    5.1727    0.0001  [ -0.0021,  0.0025]   0.50   0.50   11.79   11.79
+   low  150   40   13.2361   13.2339    0.0023  [ -0.0024,  0.0084]   0.53   0.53   33.08   33.15
+  high  150    5    0.4474    0.4506   -0.0032* [ -0.0049, -0.0015]   0.78   0.81    1.75    1.76
+  high  150   20    4.6108    4.6112   -0.0004  [ -0.0046,  0.0040]   0.60   0.60   11.36   11.35
+  high  150   40   10.8701   10.8637    0.0065* [  0.0001,  0.0133]   0.64   0.64   29.27   29.24
+
+(* = 95% CI excludes 0.)
+
+PRIMARY (high, H=20): state collapse under mode-blind
+  mix - collapse = -0.0004  [-0.0046,+0.0040]
+  degeneracy check  mix_coupled - mix = +0.00000  (should be ~0: blind has no mode)
+
+--- VELOCITY CRPS (mix - collapse, same structure as position) ---
+
+stratum    n    H  vCRPS_mix  vCRPS_col     dvCRPS                 95% CI
+   low  150    5     0.1786     0.1786   -0.0001  [ -0.0002,  0.0001]
+   low  150   20     0.4604     0.4604    0.0000  [ -0.0001,  0.0001]
+   low  150   40     0.5408     0.5407    0.0001  [ -0.0000,  0.0004]
+  high  150    5     0.1712     0.1714   -0.0002  [ -0.0004,  0.0000]
+  high  150   20     0.3801     0.3800    0.0001  [ -0.0001,  0.0002]
+  high  150   40     0.4097     0.4097    0.0000  [ -0.0001,  0.0002]
+(* = 95% CI excludes 0.  Negative dvCRPS => collapse hurts in velocity.)
+
+--- PIT RANK HISTOGRAMS (10 bins, uniform = calibrated) ---
+Flat histogram => well-calibrated. U-shape => under-dispersed.
+   low h= 5  mix_coupled px: [0.09 0.09 0.11 0.09 0.11 0.11 0.09 0.09 0.10 0.11]
+   low h= 5  mix_coupled py: [0.29 0.10 0.05 0.07 0.03 0.04 0.07 0.07 0.06 0.23]
+   low h= 5  mix_coupled vx: [0.14 0.10 0.08 0.09 0.12 0.10 0.07 0.05 0.11 0.14]
+   low h= 5  mix_coupled vy: [0.35 0.05 0.05 0.06 0.05 0.03 0.03 0.03 0.07 0.27]
+   low h= 5     collapse px: [0.08 0.10 0.12 0.09 0.11 0.12 0.08 0.10 0.09 0.11]
+   low h= 5     collapse py: [0.29 0.09 0.05 0.09 0.03 0.05 0.05 0.08 0.05 0.23]
+   low h= 5     collapse vx: [0.15 0.09 0.08 0.09 0.12 0.10 0.07 0.05 0.11 0.14]
+   low h= 5     collapse vy: [0.35 0.05 0.05 0.06 0.05 0.03 0.03 0.03 0.07 0.27]
+   low h=20  mix_coupled px: [0.33 0.06 0.05 0.03 0.02 0.04 0.07 0.04 0.07 0.30]
+   low h=20  mix_coupled py: [0.31 0.07 0.07 0.07 0.04 0.03 0.05 0.04 0.04 0.28]
+   low h=20  mix_coupled vx: [0.31 0.08 0.07 0.02 0.03 0.03 0.04 0.05 0.03 0.35]
+   low h=20  mix_coupled vy: [0.27 0.07 0.08 0.07 0.02 0.03 0.09 0.05 0.09 0.24]
+   low h=20     collapse px: [0.33 0.05 0.05 0.03 0.01 0.05 0.07 0.04 0.07 0.30]
+   low h=20     collapse py: [0.31 0.07 0.07 0.07 0.04 0.03 0.05 0.04 0.04 0.28]
+   low h=20     collapse vx: [0.31 0.07 0.08 0.02 0.03 0.03 0.04 0.05 0.03 0.34]
+   low h=20     collapse vy: [0.27 0.07 0.06 0.07 0.03 0.03 0.09 0.05 0.08 0.25]
+   low h=40  mix_coupled px: [0.31 0.08 0.05 0.04 0.04 0.02 0.04 0.05 0.07 0.31]
+   low h=40  mix_coupled py: [0.31 0.07 0.07 0.05 0.04 0.05 0.07 0.07 0.05 0.21]
+   low h=40  mix_coupled vx: [0.27 0.07 0.07 0.08 0.07 0.03 0.07 0.07 0.08 0.19]
+   low h=40  mix_coupled vy: [0.32 0.06 0.05 0.05 0.05 0.05 0.07 0.05 0.04 0.25]
+   low h=40     collapse px: [0.31 0.08 0.05 0.04 0.04 0.02 0.04 0.05 0.07 0.31]
+   low h=40     collapse py: [0.31 0.07 0.09 0.05 0.03 0.06 0.07 0.07 0.05 0.21]
+   low h=40     collapse vx: [0.27 0.07 0.07 0.08 0.07 0.03 0.07 0.07 0.08 0.19]
+   low h=40     collapse vy: [0.32 0.06 0.05 0.06 0.05 0.05 0.07 0.05 0.04 0.25]
+  high h= 5  mix_coupled px: [0.12 0.07 0.14 0.08 0.07 0.13 0.08 0.14 0.10 0.07]
+  high h= 5  mix_coupled py: [0.24 0.09 0.08 0.05 0.04 0.07 0.11 0.07 0.07 0.19]
+  high h= 5  mix_coupled vx: [0.15 0.09 0.05 0.07 0.15 0.11 0.07 0.09 0.11 0.12]
+  high h= 5  mix_coupled vy: [0.28 0.09 0.07 0.02 0.07 0.04 0.09 0.08 0.04 0.23]
+  high h= 5     collapse px: [0.11 0.08 0.15 0.08 0.07 0.11 0.09 0.15 0.09 0.07]
+  high h= 5     collapse py: [0.23 0.09 0.10 0.04 0.05 0.06 0.11 0.08 0.05 0.19]
+  high h= 5     collapse vx: [0.14 0.10 0.05 0.07 0.15 0.09 0.09 0.09 0.11 0.12]
+  high h= 5     collapse vy: [0.27 0.09 0.07 0.03 0.05 0.05 0.10 0.07 0.05 0.22]
+  high h=20  mix_coupled px: [0.23 0.09 0.07 0.07 0.03 0.04 0.03 0.07 0.09 0.28]
+  high h=20  mix_coupled py: [0.31 0.05 0.09 0.03 0.06 0.07 0.07 0.07 0.05 0.21]
+  high h=20  mix_coupled vx: [0.25 0.09 0.07 0.04 0.03 0.03 0.03 0.07 0.08 0.31]
+  high h=20  mix_coupled vy: [0.30 0.11 0.08 0.06 0.05 0.07 0.05 0.07 0.05 0.15]
+  high h=20     collapse px: [0.24 0.09 0.06 0.07 0.03 0.04 0.03 0.07 0.08 0.28]
+  high h=20     collapse py: [0.31 0.05 0.09 0.02 0.06 0.07 0.08 0.07 0.04 0.21]
+  high h=20     collapse vx: [0.25 0.09 0.08 0.03 0.03 0.03 0.03 0.06 0.09 0.30]
+  high h=20     collapse vy: [0.30 0.11 0.08 0.06 0.05 0.07 0.05 0.08 0.05 0.15]
+  high h=40  mix_coupled px: [0.21 0.07 0.08 0.04 0.06 0.07 0.07 0.07 0.05 0.27]
+  high h=40  mix_coupled py: [0.27 0.13 0.09 0.06 0.04 0.05 0.05 0.07 0.05 0.19]
+  high h=40  mix_coupled vx: [0.15 0.04 0.11 0.05 0.06 0.05 0.09 0.10 0.09 0.25]
+  high h=40  mix_coupled vy: [0.29 0.13 0.10 0.11 0.05 0.02 0.05 0.03 0.05 0.16]
+  high h=40     collapse px: [0.20 0.09 0.08 0.04 0.06 0.07 0.05 0.08 0.06 0.27]
+  high h=40     collapse py: [0.26 0.13 0.10 0.07 0.04 0.05 0.05 0.07 0.05 0.19]
+  high h=40     collapse vx: [0.15 0.04 0.11 0.05 0.07 0.05 0.09 0.11 0.09 0.25]
+  high h=40     collapse vy: [0.29 0.13 0.10 0.11 0.05 0.02 0.05 0.03 0.05 0.16]
+
+[gp_blind done in 3459s]
+
+"""
 
